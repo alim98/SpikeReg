@@ -1,0 +1,119 @@
+# SpikeReg Configuration for OASIS Brain MRI Dataset
+
+# Model architecture
+model:
+  patch_size: 64  # Larger patches for brain MRI
+  in_channels: 2  # Fixed + Moving
+  base_channels: 16
+  encoder_channels: [16, 32, 64, 128]
+  decoder_channels: [64, 32, 16, 16]
+  
+  # Time windows for each level (decreasing)
+  encoder_time_windows: [10, 8, 6, 4]
+  decoder_time_windows: [4, 6, 8, 10]
+  
+  # Input spike encoding
+  input_time_window: 10
+  
+  # Neuron parameters for each level
+  encoder_tau_u: [0.9, 0.85, 0.8, 0.75]
+  decoder_tau_u: [0.75, 0.8, 0.85, 0.9]
+  
+  # Skip connection merge strategies
+  skip_merge: ['concatenate', 'average', 'concatenate', 'none']
+  
+  # Displacement scaling (brain deformations are typically smaller)
+  displacement_scale: 0.5
+
+# Training configuration
+training:
+  # Pretraining phase
+  pretrain: true
+  pretrain_epochs: 30
+  
+  # Fine-tuning phase
+  finetune_epochs: 50
+  
+  # Iterative registration
+  num_iterations: 8  # Fewer iterations for brain registration
+  early_stop_threshold: 0.001
+  
+  # Optimizer
+  optimizer:
+    type: 'adamw'
+    lr: 0.0005  # Lower learning rate for stability
+    weight_decay: 0.01
+  
+  # Learning rate scheduler
+  scheduler:
+    type: 'cosine'
+    T_max: 80
+    eta_min: 1e-6
+  
+  # Loss function
+  loss:
+    similarity_type: 'ncc'  # NCC works well for same-modality brain MRI
+    similarity_weight: 1.0
+    regularization_type: 'bending'
+    regularization_weight: 0.005  # Lower regularization for brain
+    spike_weight: 0.001
+    spike_balance_weight: 0.01
+    target_spike_rate: 0.15  # Slightly higher activity for complex brain structures
+  
+  # Training settings
+  batch_size: 4
+  gradient_clip: 1.0
+  checkpoint_interval: 5
+  log_interval: 20
+  
+  # Data augmentation (lighter for brain MRI)
+  augmentation:
+    rotation_range: 5.0  # Smaller rotations
+    scale_range: [0.95, 1.05]  # Smaller scale changes
+    translation_range: 0.05
+    flip_prob: 0.0  # No flipping for brain (asymmetric)
+    noise_std: 0.005
+    intensity_shift: 0.05
+    intensity_scale: [0.95, 1.05]
+
+# ANN to SNN conversion
+conversion:
+  threshold_percentile: 99.0
+  calibration_samples: 100
+
+# Inference configuration
+inference:
+  patch_size: 64
+  patch_stride: 32
+  batch_size: 8
+  smooth_displacement: true
+
+# Data configuration
+data:
+  # Volume preprocessing
+  percentile_clip: [1, 99]  # Tighter clipping for brain MRI
+  
+  # Patch extraction
+  patch_size: 64
+  patch_stride: 32
+  
+  # Validation split (handled by dataset)
+  val_split: 0.15
+  
+  # Data paths
+  train_dir: 'SpikeReg/data/OASIS'
+  val_dir: 'SpikeReg/data/OASIS'
+  test_dir: 'SpikeReg/data/OASIS'
+
+# Neuromorphic deployment
+neuromorphic:
+  # Quantization
+  weight_bits: 8
+  threshold_bits: 8
+  
+  # Core mapping
+  cores_per_layer: 4
+  max_spikes_per_core: 1000
+  
+  # Time step
+  dt: 1.0  # milliseconds 
