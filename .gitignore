@@ -1,3 +1,6 @@
 *.zip
 imagesTr/*
 SpikeReg/data/*
+*.tar
+data/*
+checkpoints/*

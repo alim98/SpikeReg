@@ -15,8 +15,8 @@ import yaml
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from spikereg import SpikeRegTrainer
-from spikereg.training import load_config, save_config
+from SpikeReg import SpikeRegTrainer
+from SpikeReg.training import load_config, save_config
 from examples.oasis_dataset import create_oasis_loaders
 
 
@@ -42,7 +42,7 @@ def update_config_for_oasis(config, args):
 def main():
     parser = argparse.ArgumentParser(description='Train SpikeReg on OASIS dataset')
     parser.add_argument('--data-root', type=str, 
-                        default='/Users/ali/Documents/codes/SpikeReg/SpikeReg/data/OASIS',
+                        default='data',
                         help='Path to OASIS dataset root')
     parser.add_argument('--config', type=str, default='configs/default_config.yaml',
                         help='Path to configuration file')

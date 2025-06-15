@@ -19,10 +19,10 @@ from pathlib import Path
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from spikereg import SpikeRegTrainer
-from spikereg.training import load_config, save_config
-from utils.preprocessing import normalize_volume, PatchNormalizer
-from utils.patch_utils import extract_patches, PatchAugmentor
+from SpikeReg import SpikeRegTrainer
+from SpikeReg.training import load_config, save_config
+from SpikeReg.utils.preprocessing import normalize_volume, PatchNormalizer
+from SpikeReg.utils.patch_utils import extract_patches, PatchAugmentor
 
 
 class MedicalVolumeDataset(Dataset):

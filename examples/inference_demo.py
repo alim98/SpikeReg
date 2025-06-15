@@ -17,9 +17,11 @@ import time
 import sys
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from spikereg import SpikeRegInference
-from utils.metrics import compute_registration_metrics
-from utils.warping import SpatialTransformer
+from SpikeReg import SpikeRegInference
+
+# Use metrics and warping modules from the SpikeReg package
+from SpikeReg.utils.metrics import compute_registration_metrics
+from SpikeReg.utils.warping import SpatialTransformer
 
 
 def load_volume(path):
