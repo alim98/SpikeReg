@@ -259,11 +259,18 @@ class PretrainedUNet(nn.Module):
         
         # Decoder
         self.decoders = nn.ModuleList()
-        for i in range(len(self.decoder_channels)):
-            in_ch = self.encoder_channels[-(i+1)]
-            if i < len(self.encoder_channels)-1:
-                in_ch += self.encoder_channels[-(i+2)]  # Skip connection
-            out_ch = self.decoder_channels[i]
+        # Number of encoder levels
+        N = len(self.encoder_channels)
+        prev_ch = self.encoder_channels[-1]
+        for i, out_ch in enumerate(self.decoder_channels):
+            # Decoder 0 takes only the bottleneck features (prev_ch)
+            # Subsequent decoders concatenate with the corresponding skip feature
+            if 0 < i < N:  # skip connections available for decoders 1 .. N-1
+                skip_ch = self.encoder_channels[-(i+1)]
+                in_ch = prev_ch + skip_ch
+            else:
+                # i == 0 (first decoder) OR i >= N (should not occur)
+                in_ch = prev_ch
             
             decoder = nn.Sequential(
                 nn.ConvTranspose3d(in_ch, out_ch, 2, stride=2),
@@ -274,6 +281,7 @@ class PretrainedUNet(nn.Module):
                 nn.ReLU(inplace=True)
             )
             self.decoders.append(decoder)
+            prev_ch = out_ch
         
         # Output
         self.output = nn.Conv3d(self.decoder_channels[-1], 3, 1)
@@ -287,6 +295,31 @@ class PretrainedUNet(nn.Module):
         for encoder in self.encoders:
             x = encoder(x)
             skip_features.append(x)
+        
+        # ------------------------------------------------------------------
+        # Debug printing: run only on the first forward call to help diagnose
+        # channel mismatches between encoder outputs and decoder expectations.
+        # ------------------------------------------------------------------
+        if not hasattr(self, "_debug_printed"):
+            self._debug_printed = True
+            print("[PretrainedUNet DEBUG] Encoder feature shapes:")
+            for i, feat in enumerate(skip_features):
+                print(f"  Level {i}: {tuple(feat.shape)}")
+            print("[PretrainedUNet DEBUG] Decoder expected in_channels list:")
+            expected = []
+            N = len(self.encoder_channels)
+            prev_ch = self.encoder_channels[-1]
+            for i, out_ch in enumerate(self.decoder_channels):
+                if 0 < i < N:
+                    skip_ch = self.encoder_channels[-(i+1)]
+                    in_ch = prev_ch + skip_ch
+                else:
+                    in_ch = prev_ch
+                expected.append(in_ch)
+                prev_ch = out_ch
+            for i, ch in enumerate(expected):
+                print(f"  Decoder {i} expects {ch} channels")
+            print("------------------------------------------------------------")
         
         # Decoder
         for i, decoder in enumerate(self.decoders):

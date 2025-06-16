@@ -4,3 +4,4 @@ SpikeReg/data/*
 *.tar
 data/*
 checkpoints/*
+logs/*

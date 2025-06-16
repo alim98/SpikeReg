@@ -28,7 +28,7 @@ def _read_pairs_csv(csv_path: Path) -> List[Tuple[int, int]]:
 
 
 class L2RTask3Dataset(Dataset):
-
+    
     def __init__(
         self,
         data_dir: str,
@@ -39,7 +39,7 @@ class L2RTask3Dataset(Dataset):
         augment: bool = False,
         use_labels: bool = True,
         pairs_csv: Optional[str] = None,
-        fixed_pairs: bool = False,  
+        fixed_pairs: bool = False,
         seed: int = 42,
     ) -> None:
         self.data_dir = Path(data_dir)
@@ -50,10 +50,10 @@ class L2RTask3Dataset(Dataset):
         self.augment = augment
         self.use_labels = use_labels
         self.pairs_csv = Path(pairs_csv) if pairs_csv else None
-
+        
         random.seed(seed)
         np.random.seed(seed)
-
+        
         if self.augment:
             self.augmentor = PatchAugmentor()
         else:
@@ -65,6 +65,9 @@ class L2RTask3Dataset(Dataset):
         
         if self.split == "val" and self.pairs_csv is not None:
             self.pairs = self._pairs_from_csv()
+            # Fallback: if CSV did not yield any valid pairs, generate random ones
+            if len(self.pairs) == 0:
+                self.pairs = self._generate_pairs(len(self.volumes) * 2)
         else:
             self.pairs = self._generate_pairs(len(self.volumes) * 2)
 
@@ -112,7 +115,7 @@ class L2RTask3Dataset(Dataset):
             if fid in id_to_idx and mid in id_to_idx:
                 pairs.append((id_to_idx[fid], id_to_idx[mid]))
         return pairs
-
+    
     
     def _generate_pairs(self, num_pairs: int) -> List[Tuple[int, int]]:
         pairs: List[Tuple[int, int]] = []
@@ -144,13 +147,13 @@ class L2RTask3Dataset(Dataset):
 
         vol1 = self._load_volume(self.volumes[idx1])
         vol2 = self._load_volume(self.volumes[idx2])
-
+            
         fixed = torch.from_numpy(vol1["image"]).float().unsqueeze(0).unsqueeze(0)
         moving = torch.from_numpy(vol2["image"]).float().unsqueeze(0).unsqueeze(0)
-
+        
         fixed = normalize_volume(fixed)
         moving = normalize_volume(moving)
-
+            
         
         fixed_patches, _ = extract_patches(
             fixed,
@@ -190,19 +193,22 @@ class L2RTask3Dataset(Dataset):
 
         fixed_patch = fixed_patches[patch_idx]
         moving_patch = moving_patches[patch_idx]
-
-        if self.augment and self.augmentor is not None:
-            combined = torch.cat([fixed_patch, moving_patch], dim=1)
-            augmented = self.augmentor.augment(combined)
-            fixed_patch = augmented[:, 0:1]
-            moving_patch = augmented[:, 1:2]
-
+            
+        # Prepare output dictionary
         output = {
             "fixed": fixed_patch.squeeze(0),
             "moving": moving_patch.squeeze(0),
             "pair_idx": pair_idx,
         }
 
+        # Optional data augmentation (train split only)
+        if self.augment and self.augmentor is not None:
+            combined = torch.cat([fixed_patch, moving_patch], dim=1)
+            augmented = self.augmentor.augment(combined)
+            output["fixed"] = augmented[:, 0:1].squeeze(0)
+            output["moving"] = augmented[:, 1:2].squeeze(0)
+
+        # Attach segmentation labels if available
         if self.use_labels and vol1["label"] is not None and vol2["label"] is not None:
             fixed_label = torch.from_numpy(vol1["label"]).long().unsqueeze(0).unsqueeze(0)
             moving_label = torch.from_numpy(vol2["label"]).long().unsqueeze(0).unsqueeze(0)
@@ -252,7 +258,7 @@ def create_task3_loaders(
         augment=True,
         use_labels=True,
     )
-
+    
     val_ds = L2RTask3Dataset(
         val_dir,
         split="val",
@@ -263,7 +269,7 @@ def create_task3_loaders(
         use_labels=True,
         pairs_csv=str(pairs_csv) if pairs_csv else None,
     )
-
+    
     train_loader = torch.utils.data.DataLoader(
         train_ds,
         batch_size=batch_size,
@@ -271,7 +277,7 @@ def create_task3_loaders(
         num_workers=num_workers,
         pin_memory=True,
     )
-
+    
     val_loader = torch.utils.data.DataLoader(
         val_ds,
         batch_size=batch_size,
@@ -340,5 +346,5 @@ def create_oasis_loaders(
         patches_per_pair=patches_per_pair,
         num_workers=num_workers,
     )
-
+    
     return train_loader, val_loader
