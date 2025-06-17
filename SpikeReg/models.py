@@ -393,13 +393,19 @@ def convert_pretrained_to_spiking(
         bn_mean = pretrained_dec[1].running_mean
         bn_var = pretrained_dec[1].running_var
         
-        # Adjust for concatenation vs other merge strategies
-        if spiking_dec.skip_merge != "concatenate":
-            # Need to adjust weights if input channels differ
-            in_ch = spiking_dec.upconv.conv.in_channels
-            if conv_weight.shape[1] != in_ch:
-                # Take only the first part of weights
-                conv_weight = conv_weight[:, :in_ch]
+        # Ensure input-channel dimension matches target layer for ALL decoders
+        # ConvTranspose3d weight shape: [in_channels, out_channels, k, k, k]
+        in_ch_required = spiking_dec.upconv.conv.in_channels
+        if conv_weight.shape[0] != in_ch_required:
+            if conv_weight.shape[0] > in_ch_required:
+                print(f"[convert_pretrained_to_spiking] Trimming decoder {i} upconv weights from {conv_weight.shape[0]} to {in_ch_required} input channels")
+                conv_weight = conv_weight[:in_ch_required]
+            else:
+                # pad with zeros if pretrained has fewer channels (unlikely)
+                pad_size = in_ch_required - conv_weight.shape[0]
+                print(f"[convert_pretrained_to_spiking] Padding decoder {i} upconv weights with {pad_size} zero channels to reach {in_ch_required}")
+                pad = torch.zeros(pad_size, conv_weight.shape[1], *conv_weight.shape[2:], device=conv_weight.device)
+                conv_weight = torch.cat([conv_weight, pad], dim=0)
         
         # Transfer to spiking layer
         spiking_dec.upconv.conv.weight.data = conv_weight.clone()

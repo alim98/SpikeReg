@@ -173,15 +173,22 @@ class SpikeRegTrainer:
                 
             else:
                 # Spiking model - iterative registration
-                output = self.registration(fixed, moving, return_all_iterations=True)
+                output = self.registration(fixed, moving, return_all_iterations=False)
                 displacement = output['displacement']
                 warped = output['warped']
-                spike_counts = output['spike_count_history'][-1] if output['spike_count_history'] else {}
+                if 'spike_count_history' in output:
+                    spike_counts = output['spike_count_history'][-1] if output['spike_count_history'] else {}
+                else:
+                    spike_counts = output.get('spike_counts', {})
                 
                 # Full loss computation
                 loss, loss_dict = self.criterion(
                     fixed, moving, displacement, warped, spike_counts
                 )
+                # Ensure loss_dict values are plain Python floats for safe logging / NumPy ops
+                for k, v in loss_dict.items():
+                    if torch.is_tensor(v):
+                        loss_dict[k] = v.item()
             
             # Backward pass
             loss.backward()
@@ -196,8 +203,8 @@ class SpikeRegTrainer:
             # Optimizer step
             self.optimizer.step()
             
-            # Update metrics
-            epoch_losses.append(loss_dict['total'])
+            # Update metrics (total is now float)
+            epoch_losses.append(float(loss_dict['total']))
             
             # Log to tensorboard
             if self.global_step % self.config['training'].get('log_interval', 10) == 0:

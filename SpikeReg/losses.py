@@ -44,13 +44,16 @@ class NormalizedCrossCorrelation(nn.Module):
         
         # Compute local means
         pad = self.window_size // 2
-        fixed_mean = F.conv3d(fixed, self.kernel, padding=pad)
-        warped_mean = F.conv3d(warped, self.kernel, padding=pad)
+        kernel = self.kernel
+        if kernel.device != fixed.device:
+            kernel = kernel.to(fixed.device)
+        fixed_mean = F.conv3d(fixed, kernel, padding=pad)
+        warped_mean = F.conv3d(warped, kernel, padding=pad)
         
         # Compute local variances and covariance
-        fixed_sq = F.conv3d(fixed ** 2, self.kernel, padding=pad)
-        warped_sq = F.conv3d(warped ** 2, self.kernel, padding=pad)
-        fixed_warped = F.conv3d(fixed * warped, self.kernel, padding=pad)
+        fixed_sq = F.conv3d(fixed ** 2, kernel, padding=pad)
+        warped_sq = F.conv3d(warped ** 2, kernel, padding=pad)
+        fixed_warped = F.conv3d(fixed * warped, kernel, padding=pad)
         
         fixed_var = fixed_sq - fixed_mean ** 2
         warped_var = warped_sq - warped_mean ** 2

@@ -54,11 +54,21 @@ def main():
                         help='Path to checkpoint to resume from')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use (cuda/cpu)')
-    
+    """
+    note: 
+    patch_size = 32
+    patch_stride = 32
+    Stride equal to patch size slides the 32 × 32 × 32 window one full patch length each step, so every voxel belongs to exactly one patch and the patches just tile the volume like bricks.
+    Implications of non-overlap
+    Fewer training samples
+    For a 160 × 224 × 192 OASIS volume the count is
+    ⌊160/32⌋ × ⌊224/32⌋ × ⌊192/32⌋ = 5 × 7 × 6 = 210 patches.
+    Reducing stride to 16 (50 % overlap) multiplies the count roughly by 8.
+    """
     # Dataset specific arguments
-    parser.add_argument('--patch-size', type=int, default=64,
+    parser.add_argument('--patch-size', type=int, default=32,
                         help='Size of patches to extract')
-    parser.add_argument('--patch-stride', type=int, default=32,
+    parser.add_argument('--patch-stride', type=int, default=16,
                         help='Stride for patch extraction')
     parser.add_argument('--patches-per-pair', type=int, default=20,
                         help='Number of patches per volume pair')

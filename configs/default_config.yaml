@@ -10,8 +10,8 @@ model:
   
   # Time windows for each level (decreasing)
   encoder_time_windows: [10, 8, 6, 4]
-  decoder_time_windows: [4, 6, 8, 10]
-  
+  # decoder_time_windows: [4, 6, 8, 10]
+  decoder_time_windows: [4, 4, 4, 4]     # example for 32x32x32 patch, and this is for adjusting the time window of decoder with encoder
   # Input spike encoding
   input_time_window: 10
   
