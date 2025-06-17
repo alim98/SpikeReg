@@ -29,10 +29,12 @@ model:
 training:
   # Pretraining phase
   pretrain: true
-  pretrain_epochs: 50
+  pretrain_epochs: 1
+  # pretrain_epochs: 50
   
   # Fine-tuning phase
-  finetune_epochs: 100
+  # finetune_epochs: 100
+  finetune_epochs: 1
   
   # Iterative registration
   num_iterations: 10

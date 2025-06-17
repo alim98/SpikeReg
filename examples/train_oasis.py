@@ -42,7 +42,7 @@ def update_config_for_oasis(config, args):
 def main():
     parser = argparse.ArgumentParser(description='Train SpikeReg on OASIS dataset')
     parser.add_argument('--data-root', type=str, 
-                        default='data',
+                       default=os.path.join(os.path.dirname(__file__), '..', 'data'),
                         help='Path to OASIS dataset root')
     parser.add_argument('--config', type=str, default='configs/default_config.yaml',
                         help='Path to configuration file')
@@ -66,11 +66,13 @@ def main():
                         help='Batch size for training')
     parser.add_argument('--num-workers', type=int, default=4,
                         help='Number of data loading workers')
+    parser.add_argument('--debug-percent', type=float, default=None,
+                        help='Use only this percent of each dataset for quick debugging')
     
     # Training options
-    parser.add_argument('--pretrain-epochs', type=int, default=30,
+    parser.add_argument('--pretrain-epochs', type=int, default=1,
                         help='Number of pretraining epochs')
-    parser.add_argument('--finetune-epochs', type=int, default=50,
+    parser.add_argument('--finetune-epochs', type=int, default=1,
                         help='Number of fine-tuning epochs')
     parser.add_argument('--skip-pretrain', action='store_true',
                         help='Skip pretraining phase')
@@ -103,6 +105,33 @@ def main():
     
     print(f"Training set: {len(train_loader.dataset)} patches")
     print(f"Validation set: {len(val_loader.dataset)} patches")
+    
+    # If requested, trim datasets to a percentage for quick testing
+    if args.debug_percent is not None:
+        from torch.utils.data import Subset
+
+        # Number of patches to keep
+        n_train = max(1, int(len(train_loader.dataset) * args.debug_percent / 100.0))
+        n_val   = max(1, int(len(val_loader.dataset)   * args.debug_percent / 100.0))
+
+        train_loader = DataLoader(
+            Subset(train_loader.dataset, list(range(n_train))),
+            batch_size=args.batch_size,
+            shuffle=True,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+
+        val_loader = DataLoader(
+            Subset(val_loader.dataset, list(range(n_val))),
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=args.num_workers,
+            pin_memory=True,
+        )
+
+        print(f"[DEBUG] Running with {args.debug_percent}% of data: "
+              f"{n_train} train patches, {n_val} val patches")
     
     # Initialize trainer
     print("Initializing trainer...")

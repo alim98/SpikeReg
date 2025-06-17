@@ -64,6 +64,8 @@ class SpikeRegTrainer:
         
         # Spatial transformer for warping
         self.spatial_transformer = SpatialTransformer()
+        # Transformer for discrete segmentation labels using nearest neighbor
+        self.seg_spatial_transformer = SpatialTransformer(mode='nearest', padding_mode='border')
     
     def _init_models(self):
         """Initialize models based on training phase"""
@@ -102,19 +104,23 @@ class SpikeRegTrainer:
         else:
             raise ValueError(f"Unknown optimizer type: {optimizer_config['type']}")
         
-        # Learning rate scheduler
+        # Learning rate scheduler, casting config values to correct types
         scheduler_config = self.config['training'].get('scheduler', {})
         if scheduler_config.get('type') == 'cosine':
+            T_max = int(scheduler_config.get('T_max', 100))
+            eta_min = float(scheduler_config.get('eta_min', 1e-6))
             self.scheduler = optim.lr_scheduler.CosineAnnealingLR(
                 self.optimizer,
-                T_max=scheduler_config.get('T_max', 100),
-                eta_min=scheduler_config.get('eta_min', 1e-6)
+                T_max=T_max,
+                eta_min=eta_min
             )
         elif scheduler_config.get('type') == 'step':
+            step_size = int(scheduler_config.get('step_size', 30))
+            gamma = float(scheduler_config.get('gamma', 0.1))
             self.scheduler = optim.lr_scheduler.StepLR(
                 self.optimizer,
-                step_size=scheduler_config.get('step_size', 30),
-                gamma=scheduler_config.get('gamma', 0.1)
+                step_size=step_size,
+                gamma=gamma
             )
         else:
             self.scheduler = None
@@ -242,11 +248,13 @@ class SpikeRegTrainer:
                 if 'segmentation_fixed' in batch and 'segmentation_moving' in batch:
                     seg_fixed = batch['segmentation_fixed'].to(self.device)
                     seg_moving = batch['segmentation_moving'].to(self.device)
-                    seg_warped = self.spatial_transformer(seg_moving, displacement)
+                    # Warp segmentation labels with nearest neighbor interpolation
+                    seg_warped = self.seg_spatial_transformer(seg_moving.float(), displacement).long()
                     
                     # Dice score
                     dice = dice_score(seg_warped, seg_fixed)
-                    val_dice_scores.append(dice.item())
+                    # average over batch and classes to get a single score
+                    val_dice_scores.append(dice.mean().item())
                 
                 # Jacobian determinant statistics
                 jac_stats = jacobian_determinant_stats(displacement)

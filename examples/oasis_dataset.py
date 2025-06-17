@@ -18,12 +18,15 @@ def _read_pairs_csv(csv_path: Path) -> List[Tuple[int, int]]:
         return pairs
 
     with open(csv_path, "r") as f:
-        reader = csv.DictReader(f)
+        reader = csv.DictReader(f, skipinitialspace=True)
         for row in reader:
             try:
-                pairs.append((int(row["fixed"]), int(row["moving"])))
-            except (KeyError, ValueError):
+                fid = int(str(row["fixed"]).strip())
+                mid = int(str(row["moving"]).strip())
+                pairs.append((fid, mid))
+            except (KeyError, ValueError, TypeError):
                 continue
+    print(f"[DEBUG] _read_pairs_csv: read {len(pairs)} pairs from '{csv_path}'.")
     return pairs
 
 
@@ -61,15 +64,29 @@ class L2RTask3Dataset(Dataset):
 
         
         self.volumes = self._discover_volumes()
+        print(f"[DEBUG] Split '{self.split}': discovered {len(self.volumes)} volumes in '{self.data_dir}'.")
+        if self.volumes:
+            print(f"[DEBUG] First 5 volume IDs: {[v['id'] for v in self.volumes[:5]]} ...")
+
+        if len(self.volumes) == 0:
+            # If no volumes found, print diagnostic information
+            candidate_imgs = list(self.data_dir.glob("img*.nii.gz"))
+            print(f"[DEBUG] glob('img*.nii.gz') returned {len(candidate_imgs)} matches")
+            if candidate_imgs:
+                print(f"[DEBUG] Example files: {[p.name for p in candidate_imgs[:5]]}")
 
         
         if self.split == "val" and self.pairs_csv is not None:
             self.pairs = self._pairs_from_csv()
-            # Fallback: if CSV did not yield any valid pairs, generate random ones
+            print(f"[DEBUG] Attempting to read validation pairs from CSV: {self.pairs_csv}")
             if len(self.pairs) == 0:
+                print("[DEBUG] CSV yielded 0 valid pairs -> falling back to random generation")
                 self.pairs = self._generate_pairs(len(self.volumes) * 2)
+            else:
+                print(f"[DEBUG] Loaded {len(self.pairs)} pairs from CSV")
         else:
             self.pairs = self._generate_pairs(len(self.volumes) * 2)
+            print(f"[DEBUG] Generated {len(self.pairs)} random pairs for split '{self.split}'.")
 
     
     def _discover_volumes(self) -> List[dict]:
@@ -94,9 +111,17 @@ class L2RTask3Dataset(Dataset):
                 volumes.append({"id": sid, "image": img, "label": label})
         elif self.split in {"val", "test"}:
             for img_path in sorted(self.data_dir.glob("img*.nii.gz")):
+                # img_path is '.../imgXXXX.nii.gz'.  Path.stem on a double
+                # extension returns 'imgXXXX.nii', so we need to strip the
+                # optional '.nii' as well before casting to int.
                 try:
-                    sid = int(img_path.stem.replace("img", ""))
+                    sid_str = img_path.stem  # 'img0438.nii'
+                    sid_str = sid_str.replace("img", "")  # '0438.nii'
+                    if sid_str.endswith(".nii"):
+                        sid_str = sid_str[:-4]  # drop '.nii'
+                    sid = int(sid_str)
                 except ValueError:
+                    # Skip files with unexpected names
                     continue
                 label_path = self.data_dir / f"seg{sid:04d}.nii.gz"
                 label = label_path if label_path.exists() else None
