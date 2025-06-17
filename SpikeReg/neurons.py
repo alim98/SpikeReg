@@ -110,7 +110,8 @@ class LIFNeuron(nn.Module):
     def reset_state(self, batch_size: int, *spatial_dims: int, device: torch.device = None):
         """Reset neuron state for new sequence"""
         shape = (batch_size, *spatial_dims)
-        device = device or next(self.parameters()).device
+        # Use provided device, or fall back to this neuron's buffer device (v_th)
+        device = device if device is not None else self.v_th.device
         
         self.membrane = torch.zeros(shape, device=device)
         self.refractory_counter = torch.zeros(shape, device=device)

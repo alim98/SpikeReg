@@ -243,25 +243,25 @@ class SpikingDecoderBlock(nn.Module):
         self.skip_merge = skip_merge
         self.attention = attention
         
-        # Determine input channels based on skip merge strategy
-        if skip_merge == "concatenate":
-            total_in_channels = in_channels + skip_channels
-        else:
-            total_in_channels = in_channels
-        
-        # Upsampling path
+        # Upsampling path: operates only on decoder feature channels
         self.upconv = SpikingTransposeConv3d(
-            total_in_channels, out_channels, kernel_size,
+            in_channels, out_channels, kernel_size,
             stride=stride, tau_u=tau_u
         )
-        
-        # Skip connection processing
+
+        # Skip connection processing / attention gate
         if skip_merge == "attention" and attention:
-            self.attention_gate = AttentionGate(in_channels, skip_channels, out_channels)
-        
-        # Feature refinement
+            # Gating signal comes from upsampled decoder features (out_channels)
+            self.attention_gate = AttentionGate(out_channels, skip_channels, out_channels)
+
+        # Feature refinement after merging skip connection
+        if skip_merge in ["concatenate", "attention"]:
+            refine_in_channels = out_channels + skip_channels
+        else:
+            refine_in_channels = out_channels
+
         self.refine = SpikingConv3d(
-            out_channels, out_channels, kernel_size=3,
+            refine_in_channels, out_channels, kernel_size=3,
             stride=1, padding=1, tau_u=tau_u
         )
     
@@ -289,30 +289,66 @@ class SpikingDecoderBlock(nn.Module):
         self.upconv.reset_neurons()
         self.refine.reset_neurons()
         
-        # Merge with skip connection
-        if self.skip_merge == "concatenate":
-            # Convert spike tensor to rates for concatenation
-            x_rates = x.mean(dim=1) if x.dim() > 5 else x
-            merged = torch.cat([x_rates, skip], dim=1)
-        elif self.skip_merge == "average":
-            x_rates = x.mean(dim=1) if x.dim() > 5 else x
-            merged = (x_rates + skip) / 2
-        elif self.skip_merge == "attention" and self.attention:
-            x_rates = x.mean(dim=1) if x.dim() > 5 else x
-            skip = self.attention_gate(x_rates, skip)
-            merged = torch.cat([x_rates, skip], dim=1)
-        else:
-            merged = x.mean(dim=1) if x.dim() > 5 else x
+        # --- Debug logging ------------------------------------------------
+        if True:  # always-on verbose debugging for now
+            print("[Decoder DEBUG] ---------------------------------------------")
+            print(f"  Expected skip_channels (init arg): {skip.shape[1] if skip is not None else 'N/A'}")
+            print(f"  Block config -> in_channels: {self.upconv.conv.in_channels}, "
+                  f"out_channels: {self.upconv.conv.out_channels}, "
+                  f"skip_channels (arg): {getattr(self, 'attention_gate', None) and 'attention' or 'N/A'}")
+            print(f"  Input tensor shape: {x.shape}")
+            print(f"  Skip tensor shape:  {skip.shape}")
+            print("-------------------------------------------------------------")
         
-        # Process over time
+        # Process over time: upsample each timestep, then merge skip connections
         spike_outputs = []
+
+        seq_len = x.shape[1] if x.dim() > 5 else 1
+
         for t in range(time_steps):
-            # Upsample
-            spikes = self.upconv(merged)
-            
+            # Safely fetch input frame: clamp t to available range
+            idx = t if t < seq_len else seq_len - 1  # reuse last frame if out of bounds
+            if t >= seq_len:
+                # Optional verbose logging for debugging oversized time window requests
+                if idx == seq_len - 1:
+                    print(f"[SpikingDecoderBlock] Requested timestep {t} exceeds input sequence length {seq_len}. Reusing last frame.")
+            current = x[:, idx] if x.dim() > 5 else x
+            # Upsample to match skip resolution
+            up = self.upconv(current)
+            # Ensure spatial dimensions match before merging
+            if up.shape[2:] != skip.shape[2:]:
+                # Identify which tensor is smaller and upscale it
+                if up.shape[2] < skip.shape[2]:
+                    # Upsample decoder features to match skip (rare case if decoder produced smaller spatial size)
+                    up = F.interpolate(up, size=skip.shape[2:], mode="trilinear", align_corners=False)
+                else:
+                    # Upsample skip connection to match decoder features (common for final decoder)
+                    skip = F.interpolate(skip, size=up.shape[2:], mode="trilinear", align_corners=False)
+
+            # Merge with skip connection
+            if self.skip_merge == "concatenate":
+                merged = torch.cat([up, skip], dim=1)
+            elif self.skip_merge == "average":
+                merged = (up + skip) / 2
+            elif self.skip_merge == "attention" and self.attention:
+                gated = self.attention_gate(up, skip)
+                merged = torch.cat([up, gated], dim=1)
+            else:
+                merged = up
             # Refine features
-            spikes = self.refine(spikes)
-            
+            if merged.shape[1] != self.refine.conv.in_channels:
+                # Adjust refine layer *once* to correct channel count, avoid repeated re-instantiation
+                if not hasattr(self, "_refine_adjusted"):
+                    print(f"[Refine DEBUG] Adjusting refine layer to {merged.shape[1]} input channels (was {self.refine.conv.in_channels}).")
+                    tau_u_current = self.refine.neurons.tau_u if hasattr(self.refine, 'neurons') else 0.9
+                    self.refine = SpikingConv3d(
+                        merged.shape[1], self.refine.conv.out_channels, kernel_size=3,
+                        stride=1, padding=1, tau_u=tau_u_current
+                    )
+                    self._refine_adjusted = True
+                else:
+                    print("[Refine DEBUG] Skipping repeated refine adjustment; please verify architecture.")
+            spikes = self.refine(merged)
             spike_outputs.append(spikes)
         
         # Stack spikes over time

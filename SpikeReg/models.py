@@ -74,8 +74,16 @@ class SpikeRegUNet(nn.Module):
         # Build decoder
         self.decoder_blocks = nn.ModuleList()
         for i in range(len(self.decoder_channels)):
+            # Decoder receives features from encoder level -(i+1)
             in_ch = self.encoder_channels[-(i+1)]
-            skip_ch = self.encoder_channels[-(i+2)] if i < len(self.encoder_channels)-1 else self.base_channels
+            
+            # Determine expected skip channels based on forward logic:
+            #   skip_idx = -(i+2) if within range else encoder_features[0]
+            if i + 2 <= len(self.encoder_channels):
+                skip_ch = self.encoder_channels[-(i+2)]
+            else:
+                skip_ch = self.encoder_channels[0]  # Fallback to first encoder level
+            
             out_ch = self.decoder_channels[i]
             
             block = SpikingDecoderBlock(
