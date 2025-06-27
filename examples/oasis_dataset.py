@@ -26,7 +26,7 @@ def _read_pairs_csv(csv_path: Path) -> List[Tuple[int, int]]:
                 pairs.append((fid, mid))
             except (KeyError, ValueError, TypeError):
                 continue
-    print(f"[DEBUG] _read_pairs_csv: read {len(pairs)} pairs from '{csv_path}'.")
+
     return pairs
 
 
@@ -64,29 +64,18 @@ class L2RTask3Dataset(Dataset):
 
         
         self.volumes = self._discover_volumes()
-        print(f"[DEBUG] Split '{self.split}': discovered {len(self.volumes)} volumes in '{self.data_dir}'.")
-        if self.volumes:
-            print(f"[DEBUG] First 5 volume IDs: {[v['id'] for v in self.volumes[:5]]} ...")
 
         if len(self.volumes) == 0:
             # If no volumes found, print diagnostic information
             candidate_imgs = list(self.data_dir.glob("img*.nii.gz"))
-            print(f"[DEBUG] glob('img*.nii.gz') returned {len(candidate_imgs)} matches")
-            if candidate_imgs:
-                print(f"[DEBUG] Example files: {[p.name for p in candidate_imgs[:5]]}")
 
         
         if self.split == "val" and self.pairs_csv is not None:
             self.pairs = self._pairs_from_csv()
-            print(f"[DEBUG] Attempting to read validation pairs from CSV: {self.pairs_csv}")
             if len(self.pairs) == 0:
-                print("[DEBUG] CSV yielded 0 valid pairs -> falling back to random generation")
                 self.pairs = self._generate_pairs(len(self.volumes) * 2)
-            else:
-                print(f"[DEBUG] Loaded {len(self.pairs)} pairs from CSV")
         else:
             self.pairs = self._generate_pairs(len(self.volumes) * 2)
-            print(f"[DEBUG] Generated {len(self.pairs)} random pairs for split '{self.split}'.")
 
     
     def _discover_volumes(self) -> List[dict]:
@@ -192,8 +181,15 @@ class L2RTask3Dataset(Dataset):
         )
 
         if not fixed_patches:
-            raise RuntimeError("Failed to extract patches from volume")
-
+            raise RuntimeError("Failed to extract patches from fixed volume")
+            
+        if not moving_patches:
+            raise RuntimeError("Failed to extract patches from moving volume")
+        
+        # Ensure we only consider indices that are valid for both patch lists
+        max_valid_idx = min(len(fixed_patches), len(moving_patches)) - 1
+        if max_valid_idx < 0:
+            raise RuntimeError("No valid patches found in both volumes")
         
         # ------------------------------------------------------------------
         # Brain-coverage filter: keep sampling until a patch contains a minimum
@@ -201,37 +197,71 @@ class L2RTask3Dataset(Dataset):
         # This avoids wasting training iterations on empty background patches.
         # ------------------------------------------------------------------
 
-        def _is_valid(p: torch.Tensor, frac: float = 0.10, thresh: float = 0.15) -> bool:
-            """Return True if at least *frac* voxels are > *thresh*."""
-            return (p > thresh).float().mean().item() > frac
+        def _is_valid(p: torch.Tensor, frac: float = 0.50, thresh: float = 0.10) -> bool:
+            """Return True if at least *frac* voxels are > *thresh*.
+            
+            Aggressive filtering for normalized brain data:
+            - thresh=0.10: Higher threshold to ensure brain tissue
+            - frac=0.50: Require 50% of patch to contain brain tissue
+            """
+            try:
+                if p.dtype in [torch.long, torch.int32, torch.int64, torch.int, torch.int8, torch.int16]:
+                    # For integer data (segmentation data), check if there are enough non-zero voxels
+                    return (p > 0).float().mean().item() > frac
+                else:
+                    # For floating point data (intensity data), use threshold
+                    return (p > thresh).float().mean().item() > frac
+            except Exception as e:
+                # Fallback: consider patch valid
+                print(f"Warning: Error in patch validation ({e}), considering patch valid")
+                return True
 
-        max_attempts = 20
+        max_attempts = 50  # Increased attempts to find good brain patches
         patch_idx = None
         for _ in range(max_attempts):
-            cand_idx = random.randint(0, len(fixed_patches) - 1)
-            if _is_valid(fixed_patches[cand_idx]):
+            cand_idx = random.randint(0, max_valid_idx)
+            if _is_valid(fixed_patches[cand_idx]) and _is_valid(moving_patches[cand_idx]):
                 patch_idx = cand_idx
                 break
 
         if patch_idx is None:  # fallback if no suitable patch found
-            patch_idx = random.randint(0, len(fixed_patches) - 1)
+            # Try to find the best available patch (highest tissue content)
+            best_score = -1
+            best_idx = 0
+            for i in range(min(20, len(fixed_patches))):  # Check first 20 patches
+                fixed_score = (fixed_patches[i] > 0.05).float().mean().item()
+                moving_score = (moving_patches[i] > 0.05).float().mean().item()
+                score = min(fixed_score, moving_score)
+                if score > best_score:
+                    best_score = score
+                    best_idx = i
+            patch_idx = best_idx
 
         fixed_patch = fixed_patches[patch_idx]
         moving_patch = moving_patches[patch_idx]
             
-        # Prepare output dictionary
+        # Prepare output dictionary - keep channel dimension
         output = {
-            "fixed": fixed_patch.squeeze(0),
-            "moving": moving_patch.squeeze(0),
+            "fixed": fixed_patch,  # Keep as (1, 64, 64, 64)
+            "moving": moving_patch,  # Keep as (1, 64, 64, 64)
             "pair_idx": pair_idx,
         }
 
         # Optional data augmentation (train split only)
         if self.augment and self.augmentor is not None:
-            combined = torch.cat([fixed_patch, moving_patch], dim=1)
-            augmented = self.augmentor.augment(combined)
-            output["fixed"] = augmented[:, 0:1].squeeze(0)
-            output["moving"] = augmented[:, 1:2].squeeze(0)
+            # Apply the same augmentation to both images to maintain correspondence
+            # First, generate random augmentation parameters
+            import torch.nn.functional as F
+            
+            # Apply same spatial transformations to both patches
+            seed = torch.randint(0, 1000000, (1,)).item()
+            
+            # Set same random seed for both augmentations to ensure same transforms
+            torch.manual_seed(seed)
+            output["fixed"] = self.augmentor.augment(fixed_patch)  # Keep channel dimension
+            
+            torch.manual_seed(seed)  # Reset to same seed
+            output["moving"] = self.augmentor.augment(moving_patch)  # Keep channel dimension
 
         # Attach segmentation labels if available
         if self.use_labels and vol1["label"] is not None and vol2["label"] is not None:
@@ -249,11 +279,13 @@ class L2RTask3Dataset(Dataset):
                 self.patch_stride,
             )
 
-            if fixed_label_patches and patch_idx < len(fixed_label_patches):
+            # Only add segmentation if we have valid patches for both and the patch_idx is in range
+            if (fixed_label_patches and moving_label_patches and 
+                patch_idx < len(fixed_label_patches) and patch_idx < len(moving_label_patches)):
                 fixed_label_patch = fixed_label_patches[patch_idx]
                 moving_label_patch = moving_label_patches[patch_idx]
-                output["segmentation_fixed"] = fixed_label_patch.squeeze(0)
-                output["segmentation_moving"] = moving_label_patch.squeeze(0)
+                output["segmentation_fixed"] = fixed_label_patch  # Keep channel dimension
+                output["segmentation_moving"] = moving_label_patch  # Keep channel dimension
 
         return output
 
@@ -271,7 +303,7 @@ def create_task3_loaders(
     num_workers: int = 4,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Optional[torch.utils.data.DataLoader]]:
 
-    pairs_csv = Path(train_dir) / "pairs_val.csv"
+    pairs_csv = Path(val_dir) / "pairs_val.csv"
     pairs_csv = pairs_csv if pairs_csv.exists() else None
 
     train_ds = L2RTask3Dataset(

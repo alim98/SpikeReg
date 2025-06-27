@@ -10,6 +10,8 @@ optionally the warped patch after registration with a trained model.
 
 from pathlib import Path
 import argparse
+import matplotlib
+matplotlib.use('Agg')  # Use non-interactive backend
 import matplotlib.pyplot as plt
 import torch
 import os, sys
@@ -79,8 +81,9 @@ def main():
         args.data_root, args.patch_size, args.patch_stride, min_mean=args.min_mean
     )
 
-    fixed  = sample["fixed"][0, 0].numpy()   # [D,H,W]
-    moving = sample["moving"][0, 0].numpy()
+    # Handle the tensor dimensions correctly: [B, C, T, D, H, W] -> [D, H, W]
+    fixed  = sample["fixed"][0, 0, 0].numpy()   # [D,H,W]
+    moving = sample["moving"][0, 0, 0].numpy()
 
     warped = None
     if args.show_warped:
@@ -121,12 +124,23 @@ def main():
         axes[2].axis("off")
 
     plt.tight_layout()
-    plt.show()
-    # Save the figure if output path is provided
-    # if args.output:
-    output_path = "/teamspace/studios/this_studio/SpikeReg/test/oasis_sample.png"
+    
+    # Save the figure
+    output_path = "oasis_sample_visualization.png"
     plt.savefig(output_path, bbox_inches='tight', dpi=300)
     print(f"Saved visualization to {output_path}")
+    
+    # Print some stats about the sample
+    print(f"\nSample statistics:")
+    print(f"Fixed patch shape: {sample['fixed'].shape}")
+    print(f"Moving patch shape: {sample['moving'].shape}")
+    print(f"Fixed intensity range: [{fixed.min():.3f}, {fixed.max():.3f}]")
+    print(f"Moving intensity range: [{moving.min():.3f}, {moving.max():.3f}]")
+    
+    if 'segmentation_fixed' in sample:
+        print(f"Segmentation available: Fixed {sample['segmentation_fixed'].shape}, Moving {sample['segmentation_moving'].shape}")
+    
+    plt.close()  # Clean up
 
 if __name__ == "__main__":
     main() 

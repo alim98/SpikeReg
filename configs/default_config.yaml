@@ -101,11 +101,11 @@ data:
   
   # Validation split
   val_split: 0.2
-  
-  # Data paths (to be filled)
-  train_dir: 'data/train'
-  val_dir: 'data/val'
-  test_dir: 'data/test'
+
+  # Data paths for L2R Task 3 OASIS dataset
+  train_dir: 'data/L2R_2021_Task3_train'
+  val_dir: 'data/L2R_2021_Task3_val'
+  test_dir: 'data/L2R_2021_Task3_val'
 
 # Neuromorphic deployment
 neuromorphic:
