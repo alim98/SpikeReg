@@ -1,6 +1,5 @@
 #!/bin/bash
 
-cd SpikeReg
 
 # Install requirements
 pip install -r requirements.txt
@@ -30,7 +29,6 @@ for subject_id in {438..457}; do
         rm -rf "$subject_dir"
     fi
 done
-
 cd ../..
 
 # Clean up unnecessary files
