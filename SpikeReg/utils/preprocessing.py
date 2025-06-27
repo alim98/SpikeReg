@@ -16,20 +16,22 @@ def normalize_volume(
     Normalize volume intensities to [0, 1] range
     
     Args:
-        volume: Input volume tensor [B, C, D, H, W]
+        volume: Input volume tensor [B, C, D, H, W] or [C, D, H, W]
         percentile_range: Percentiles for clipping outliers
         eps: Small epsilon for numerical stability
         
     Returns:
         normalized: Normalized volume
     """
-    B, C, D, H, W = volume.shape
-    normalized = torch.zeros_like(volume)
-    
-    for b in range(B):
+    # Handle both 4D and 5D tensors
+    if volume.dim() == 4:
+        # Single volume [C, D, H, W]
+        C, D, H, W = volume.shape
+        normalized = torch.zeros_like(volume)
+        
         for c in range(C):
-            # Get volume for this batch and channel
-            vol = volume[b, c]
+            # Get volume for this channel
+            vol = volume[c]
             
             # Compute percentiles
             p_low = torch.quantile(vol.flatten(), percentile_range[0] / 100.0)
@@ -37,7 +39,27 @@ def normalize_volume(
             
             # Clip and normalize
             vol_clipped = torch.clamp(vol, p_low, p_high)
-            normalized[b, c] = (vol_clipped - p_low) / (p_high - p_low + eps)
+            normalized[c] = (vol_clipped - p_low) / (p_high - p_low + eps)
+            
+    elif volume.dim() == 5:
+        # Batched volumes [B, C, D, H, W]
+        B, C, D, H, W = volume.shape
+        normalized = torch.zeros_like(volume)
+        
+        for b in range(B):
+            for c in range(C):
+                # Get volume for this batch and channel
+                vol = volume[b, c]
+                
+                # Compute percentiles
+                p_low = torch.quantile(vol.flatten(), percentile_range[0] / 100.0)
+                p_high = torch.quantile(vol.flatten(), percentile_range[1] / 100.0)
+                
+                # Clip and normalize
+                vol_clipped = torch.clamp(vol, p_low, p_high)
+                normalized[b, c] = (vol_clipped - p_low) / (p_high - p_low + eps)
+    else:
+        raise ValueError(f"Expected 4D or 5D tensor, got {volume.dim()}D tensor with shape {volume.shape}")
     
     return normalized
 

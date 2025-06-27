@@ -289,16 +289,16 @@ class SpikingDecoderBlock(nn.Module):
         self.upconv.reset_neurons()
         self.refine.reset_neurons()
         
-        # --- Debug logging ------------------------------------------------
-        if True:  # always-on verbose debugging for now
-            print("[Decoder DEBUG] ---------------------------------------------")
-            print(f"  Expected skip_channels (init arg): {skip.shape[1] if skip is not None else 'N/A'}")
-            print(f"  Block config -> in_channels: {self.upconv.conv.in_channels}, "
-                  f"out_channels: {self.upconv.conv.out_channels}, "
-                  f"skip_channels (arg): {getattr(self, 'attention_gate', None) and 'attention' or 'N/A'}")
-            print(f"  Input tensor shape: {x.shape}")
-            print(f"  Skip tensor shape:  {skip.shape}")
-            print("-------------------------------------------------------------")
+        # # --- Debug logging ------------------------------------------------
+        # if True:  # always-on verbose debugging for now
+        #     print("[Decoder DEBUG] ---------------------------------------------")
+        #     print(f"  Expected skip_channels (init arg): {skip.shape[1] if skip is not None else 'N/A'}")
+        #     print(f"  Block config -> in_channels: {self.upconv.conv.in_channels}, "
+        #           f"out_channels: {self.upconv.conv.out_channels}, "
+        #           f"skip_channels (arg): {getattr(self, 'attention_gate', None) and 'attention' or 'N/A'}")
+        #     print(f"  Input tensor shape: {x.shape}")
+        #     print(f"  Skip tensor shape:  {skip.shape}")
+        #     print("-------------------------------------------------------------")
         
         # Process over time: upsample each timestep, then merge skip connections
         spike_outputs = []

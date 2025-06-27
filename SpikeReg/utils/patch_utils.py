@@ -29,6 +29,17 @@ def extract_patches(
         patches: List of patch tensors
         coordinates: List of patch top-left coordinates
     """
+    # Handle both 4D and 5D tensors
+    if volume.dim() == 4:
+        # Single volume [C, D, H, W] - add batch dimension
+        volume = volume.unsqueeze(0)
+        was_4d = True
+    elif volume.dim() == 5:
+        # Batched volume [B, C, D, H, W]
+        was_4d = False
+    else:
+        raise ValueError(f"Expected 4D or 5D tensor, got {volume.dim()}D tensor with shape {volume.shape}")
+    
     B, C, D, H, W = volume.shape
     
     # Convert to tuple if needed
@@ -62,6 +73,11 @@ def extract_patches(
             for w in range(0, W_padded - pw + 1, sw):
                 # Extract patch
                 patch = volume[:, :, d:d+pd, h:h+ph, w:w+pw]
+                
+                # Remove batch dimension if input was 4D
+                if was_4d:
+                    patch = patch.squeeze(0)
+                
                 patches.append(patch)
                 coordinates.append((d, h, w))
     
@@ -283,6 +299,17 @@ class PatchAugmentor:
     
     def augment(self, patch: torch.Tensor) -> torch.Tensor:
         """Apply random augmentations to patch"""
+        # Handle both 4D and 5D tensors
+        if patch.dim() == 4:
+            # Single patch [C, D, H, W] - add batch dimension
+            patch = patch.unsqueeze(0)
+            was_4d = True
+        elif patch.dim() == 5:
+            # Batched patches [B, C, D, H, W]
+            was_4d = False
+        else:
+            raise ValueError(f"Expected 4D or 5D tensor, got {patch.dim()}D tensor with shape {patch.shape}")
+        
         B, C, D, H, W = patch.shape
         device = patch.device
         
@@ -323,6 +350,10 @@ class PatchAugmentor:
         if self.noise_std > 0:
             noise = torch.randn_like(patch) * self.noise_std
             patch = patch + noise
+        
+        # Remove batch dimension if input was 4D
+        if was_4d:
+            patch = patch.squeeze(0)
         
         return patch
 

@@ -162,8 +162,8 @@ class L2RTask3Dataset(Dataset):
         vol1 = self._load_volume(self.volumes[idx1])
         vol2 = self._load_volume(self.volumes[idx2])
             
-        fixed = torch.from_numpy(vol1["image"]).float().unsqueeze(0).unsqueeze(0)
-        moving = torch.from_numpy(vol2["image"]).float().unsqueeze(0).unsqueeze(0)
+        fixed = torch.from_numpy(vol1["image"]).float().unsqueeze(0)
+        moving = torch.from_numpy(vol2["image"]).float().unsqueeze(0)
         
         fixed = normalize_volume(fixed)
         moving = normalize_volume(moving)
@@ -265,8 +265,8 @@ class L2RTask3Dataset(Dataset):
 
         # Attach segmentation labels if available
         if self.use_labels and vol1["label"] is not None and vol2["label"] is not None:
-            fixed_label = torch.from_numpy(vol1["label"]).long().unsqueeze(0).unsqueeze(0)
-            moving_label = torch.from_numpy(vol2["label"]).long().unsqueeze(0).unsqueeze(0)
+            fixed_label = torch.from_numpy(vol1["label"]).long().unsqueeze(0)
+            moving_label = torch.from_numpy(vol2["label"]).long().unsqueeze(0)
 
             fixed_label_patches, _ = extract_patches(
                 fixed_label,
