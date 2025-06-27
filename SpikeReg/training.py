@@ -33,12 +33,22 @@ class SpikeRegTrainer:
         config: Dict,
         checkpoint_dir: str = "checkpoints",
         log_dir: str = "logs",
-        device: str = "cuda"
+        device: str = "cuda",
+        multi_gpu_config: Dict = None
     ):
         self.config = config
         self.checkpoint_dir = checkpoint_dir
         self.log_dir = log_dir
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        
+        # Multi-GPU configuration
+        self.multi_gpu_config = multi_gpu_config or {}
+        self.use_multi_gpu = self.multi_gpu_config.get('use_multi_gpu', False)
+        self.gpu_ids = self.multi_gpu_config.get('gpu_ids', None)
+        self.distributed = self.multi_gpu_config.get('distributed', False)
+        
+        # Setup multi-GPU environment
+        self._setup_multi_gpu()
         
         # Create directories
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -67,15 +77,73 @@ class SpikeRegTrainer:
         # Transformer for discrete segmentation labels using nearest neighbor
         self.seg_spatial_transformer = SpatialTransformer(mode='nearest', padding_mode='border')
     
+    def _setup_multi_gpu(self):
+        """Setup multi-GPU environment"""
+        if not self.use_multi_gpu or not torch.cuda.is_available():
+            print(f"Training on single device: {self.device}")
+            return
+        
+        # Check available GPUs
+        num_gpus = torch.cuda.device_count()
+        if num_gpus < 2:
+            print(f"Warning: Only {num_gpus} GPU available, disabling multi-GPU training")
+            self.use_multi_gpu = False
+            return
+        
+        # Setup GPU IDs
+        if self.gpu_ids is None:
+            self.gpu_ids = list(range(num_gpus))
+        else:
+            self.gpu_ids = [int(id) for id in self.gpu_ids]
+        
+        # Validate GPU IDs
+        for gpu_id in self.gpu_ids:
+            if gpu_id >= num_gpus:
+                raise ValueError(f"GPU ID {gpu_id} not available. Only {num_gpus} GPUs detected.")
+        
+        print(f"Setting up multi-GPU training on GPUs: {self.gpu_ids}")
+        
+        # Set primary GPU
+        if 'cuda' in str(self.device):
+            torch.cuda.set_device(self.gpu_ids[0])
+            self.device = torch.device(f'cuda:{self.gpu_ids[0]}')
+        
+        if self.distributed:
+            print("Using DistributedDataParallel")
+            # Note: Full DDP setup would require additional initialization
+            # For now, we'll use DataParallel as it's simpler
+            print("Warning: DistributedDataParallel not fully implemented, falling back to DataParallel")
+        else:
+            print("Using DataParallel")
+    
+    def _wrap_model_for_multi_gpu(self, model):
+        """Wrap model for multi-GPU training"""
+        if not self.use_multi_gpu or len(self.gpu_ids) < 2:
+            return model
+        
+        if self.distributed:
+            # TODO: Implement DistributedDataParallel
+            # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=self.gpu_ids)
+            model = torch.nn.DataParallel(model, device_ids=self.gpu_ids)
+        else:
+            model = torch.nn.DataParallel(model, device_ids=self.gpu_ids)
+        
+        print(f"Model wrapped for multi-GPU training on devices: {self.gpu_ids}")
+        return model
+    
     def _init_models(self):
         """Initialize models based on training phase"""
         if self.config['training']['pretrain']:
             # Initialize pretrained U-Net
             self.pretrained_model = PretrainedUNet(self.config['model']).to(self.device)
+            # Wrap for multi-GPU if enabled
+            self.pretrained_model = self._wrap_model_for_multi_gpu(self.pretrained_model)
             self.current_model = self.pretrained_model
         else:
             # Initialize spiking model directly
             self.spiking_model = SpikeRegUNet(self.config['model']).to(self.device)
+            # Wrap for multi-GPU if enabled
+            self.spiking_model = self._wrap_model_for_multi_gpu(self.spiking_model)
             self.current_model = self.spiking_model
             
             # Create iterative registration wrapper
@@ -322,12 +390,20 @@ class SpikeRegTrainer:
         
         print("Converting pretrained model to spiking...")
         
+        # Get the underlying model if wrapped with DataParallel
+        base_model = self.pretrained_model
+        if hasattr(self.pretrained_model, 'module'):
+            base_model = self.pretrained_model.module
+        
         # Convert model
         self.spiking_model = convert_pretrained_to_spiking(
-            self.pretrained_model,
+            base_model,
             self.config['model'],
             threshold_percentile=self.config['conversion'].get('threshold_percentile', 99.0)
         ).to(self.device)
+        
+        # Wrap for multi-GPU if enabled
+        self.spiking_model = self._wrap_model_for_multi_gpu(self.spiking_model)
         
         # Update current model
         self.current_model = self.spiking_model
@@ -336,9 +412,13 @@ class SpikeRegTrainer:
         self._init_optimizer()
         self._init_loss()
         
-        # Create registration wrapper
+        # Create registration wrapper (using base model for registration)
+        base_spiking_model = self.spiking_model
+        if hasattr(self.spiking_model, 'module'):
+            base_spiking_model = self.spiking_model.module
+        
         self.registration = IterativeRegistration(
-            self.spiking_model,
+            base_spiking_model,
             num_iterations=self.config['training'].get('num_iterations', 10),
             early_stop_threshold=self.config['training'].get('early_stop_threshold', 0.001)
         )

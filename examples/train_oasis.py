@@ -54,6 +54,15 @@ def main():
                         help='Path to checkpoint to resume from')
     parser.add_argument('--device', type=str, default='cuda',
                         help='Device to use (cuda/cpu)')
+    
+    # Multi-GPU options
+    parser.add_argument('--multi-gpu', action='store_true',
+                        help='Use multiple GPUs if available')
+    parser.add_argument('--gpu-ids', type=str, default=None,
+                        help='Comma-separated GPU IDs to use (e.g., "0,1")')
+    parser.add_argument('--distributed', action='store_true',
+                        help='Use DistributedDataParallel instead of DataParallel')
+    
     """
     note: 
     patch_size = 32
@@ -143,13 +152,21 @@ def main():
         print(f"[DEBUG] Running with {args.debug_percent}% of data: "
               f"{n_train} train patches, {n_val} val patches")
     
+    # Setup multi-GPU configuration
+    multi_gpu_config = {
+        'use_multi_gpu': args.multi_gpu,
+        'gpu_ids': args.gpu_ids.split(',') if args.gpu_ids else None,
+        'distributed': args.distributed
+    }
+    
     # Initialize trainer
     print("Initializing trainer...")
     trainer = SpikeRegTrainer(
         config,
         checkpoint_dir=args.checkpoint_dir,
         log_dir=args.log_dir,
-        device=args.device
+        device=args.device,
+        multi_gpu_config=multi_gpu_config
     )
     
     # Resume from checkpoint if specified
