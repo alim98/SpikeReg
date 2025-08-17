@@ -13,6 +13,7 @@ import os
 from typing import Dict, Optional, Tuple, List
 import yaml
 import json
+from contextlib import redirect_stdout
 
 from .models import SpikeRegUNet, PretrainedUNet, convert_pretrained_to_spiking
 from .registration import IterativeRegistration
@@ -256,74 +257,76 @@ class SpikeRegTrainer:
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {self.epoch}")
         
-        for batch_idx, batch in enumerate(progress_bar):
-            # Get data
-            fixed = batch['fixed'].to(self.device)
-            moving = batch['moving'].to(self.device)
-            
-            # Zero gradients
-            self.optimizer.zero_grad()
-            
-            # Forward pass
-            if self.current_model == self.pretrained_model:
-                # Pretrained model - direct prediction
-                displacement = self.current_model(fixed, moving)
-                warped = self.spatial_transformer(moving, displacement)
-                
-                # Simple MSE loss
-                loss = self.criterion(warped, fixed)
-                loss_dict = {'total': loss.item()}
-                spike_counts = {}
-                
-            else:
-                # Spiking model - iterative registration
-                output = self.registration(fixed, moving, return_all_iterations=False)
-                displacement = output['displacement']
-                warped = output['warped']
-                if 'spike_count_history' in output:
-                    spike_counts = output['spike_count_history'][-1] if output['spike_count_history'] else {}
-                else:
-                    spike_counts = output.get('spike_counts', {})
-                
-                # Full loss computation
-                loss, loss_dict = self.criterion(
-                    fixed, moving, displacement, warped, spike_counts
-                )
-                # Ensure loss_dict values are plain Python floats for safe logging / NumPy ops
-                for k, v in loss_dict.items():
-                    if torch.is_tensor(v):
-                        loss_dict[k] = v.item()
-                # log registration output
-                with open(self.log_file, 'a') as f:
-                    f.write(f"Registration output similarity score for batch {batch_idx}: {output['similarity_scores'].item()}\n")
-                    f.write(f"Spike counts number for batch {batch_idx}: {output['spike_count_history_number']}\n")
-                    if 'hasNaN' in output:
-                        f.write(f"Warning: Has NaN in displacement or warped, displacement: {output['displacement']}\n")
-                            
-            # Backward pass
-            loss.backward()
-            
-            # Gradient clipping
-            if self.config['training'].get('gradient_clip', 0) > 0:
-                torch.nn.utils.clip_grad_norm_(
-                    self.current_model.parameters(),
-                    self.config['training']['gradient_clip']
-                )
-            
-            # Optimizer step
-            self.optimizer.step()
-            
-            # Update metrics (total is now float)
-            epoch_losses.append(float(loss_dict['total']))
-            
-            # Log to tensorboard
-            if self.global_step % self.config['training'].get('log_interval', 10) == 0:
-                self._log_training_step(loss_dict, spike_counts)
-            
-            # Update progress bar
-            progress_bar.set_postfix(loss=loss_dict['total'])
-            
-            self.global_step += 1
+        with open(os.path.join(self.log_dir, "stdout.txt"), "a") as f:
+            with redirect_stdout(f):
+                for batch_idx, batch in enumerate(progress_bar):
+                    # Get data
+                    fixed = batch['fixed'].to(self.device)
+                    moving = batch['moving'].to(self.device)
+                    
+                    # Zero gradients
+                    self.optimizer.zero_grad()
+                    
+                    # Forward pass
+                    if self.current_model == self.pretrained_model:
+                        # Pretrained model - direct prediction
+                        displacement = self.current_model(fixed, moving)
+                        warped = self.spatial_transformer(moving, displacement)
+                        
+                        # Simple MSE loss
+                        loss = self.criterion(warped, fixed)
+                        loss_dict = {'total': loss.item()}
+                        spike_counts = {}
+                        
+                    else:
+                        # Spiking model - iterative registration
+                        output = self.registration(fixed, moving, return_all_iterations=False)
+                        displacement = output['displacement']
+                        warped = output['warped']
+                        if 'spike_count_history' in output:
+                            spike_counts = output['spike_count_history'][-1] if output['spike_count_history'] else {}
+                        else:
+                            spike_counts = output.get('spike_counts', {})
+                        
+                        # Full loss computation
+                        loss, loss_dict = self.criterion(
+                            fixed, moving, displacement, warped, spike_counts
+                        )
+                        # Ensure loss_dict values are plain Python floats for safe logging / NumPy ops
+                        for k, v in loss_dict.items():
+                            if torch.is_tensor(v):
+                                loss_dict[k] = v.item()
+                        # log registration output
+                        with open(self.log_file, 'a') as f:
+                            f.write(f"Registration output similarity score for batch {batch_idx}: {output['similarity_scores']}\n")
+                            f.write(f"Spike counts number for batch {batch_idx}: {output['spike_count_history_number']}\n")
+                            if 'hasNaN' in output and output['hasNaN']:
+                                f.write(f"Warning: Has NaN in displacement or warped, displacement: {output['displacement']}\n")
+                                    
+                    # Backward pass
+                    loss.backward()
+                    
+                    # Gradient clipping
+                    if self.config['training'].get('gradient_clip', 0) > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            self.current_model.parameters(),
+                            self.config['training']['gradient_clip']
+                        )
+                    
+                    # Optimizer step
+                    self.optimizer.step()
+                    
+                    # Update metrics (total is now float)
+                    epoch_losses.append(float(loss_dict['total']))
+                    
+                    # Log to tensorboard
+                    if self.global_step % self.config['training'].get('log_interval', 10) == 0:
+                        self._log_training_step(loss_dict, spike_counts)
+                    
+                    # Update progress bar
+                    progress_bar.set_postfix(loss=loss_dict['total'])
+                    
+                    self.global_step += 1
 
         # Compute epoch statistics
         epoch_metrics['loss'] = np.mean(epoch_losses)
@@ -345,49 +348,51 @@ class SpikeRegTrainer:
             f.write(f"Starting validation epoch {self.epoch}\n")
         
         with torch.no_grad():
-            for batch in tqdm(val_loader, desc="Validation"):
-                # Get data
-                fixed = batch['fixed'].to(self.device)
-                moving = batch['moving'].to(self.device)
-                
-                # Forward pass
-                if self.current_model == self.pretrained_model:
-                    displacement = self.current_model(fixed, moving)
-                    warped = self.spatial_transformer(moving, displacement)
-                    loss = self.criterion(warped, fixed)
-                    val_losses.append(loss.item())
-                else:
-                    output = self.registration(fixed, moving)
-                    displacement = output['displacement']
-                    warped = output['warped']
-                    
-                    # Compute loss
-                    loss, _ = self.criterion(
-                        fixed, moving, displacement, warped, 
-                        output.get('spike_counts', {})
-                    )
-                    val_losses.append(loss.item())
-                    with open(self.log_file, 'a') as f:
-                        f.write(f"Validation output similarity score: {output['similarity_scores'].item()}\n")
-                        f.write(f"Spike counts number: {output['spike_count_history_number']}\n")
-                        if 'hasNaN' in output:
-                            f.write(f"Warning: Has NaN in displacement or warped, displacement: {output['displacement']}\n")
-                
-                # Compute metrics
-                if 'segmentation_fixed' in batch and 'segmentation_moving' in batch:
-                    seg_fixed = batch['segmentation_fixed'].to(self.device)
-                    seg_moving = batch['segmentation_moving'].to(self.device)
-                    # Warp segmentation labels with nearest neighbor interpolation
-                    seg_warped = self.seg_spatial_transformer(seg_moving.float(), displacement).long()
-                    
-                    # Dice score
-                    dice = dice_score(seg_warped, seg_fixed)
-                    # average over batch and classes to get a single score
-                    val_dice_scores.append(dice.mean().item())
-                
-                # Jacobian determinant statistics
-                jac_stats = jacobian_determinant_stats(displacement)
-                val_jacobian_stats.append(jac_stats)
+            with open(os.path.join(self.log_dir, "stdout.txt"), "a") as f:
+                with redirect_stdout(f):
+                    for batch in tqdm(val_loader, desc="Validation"):
+                        # Get data
+                        fixed = batch['fixed'].to(self.device)
+                        moving = batch['moving'].to(self.device)
+                        
+                        # Forward pass
+                        if self.current_model == self.pretrained_model:
+                            displacement = self.current_model(fixed, moving)
+                            warped = self.spatial_transformer(moving, displacement)
+                            loss = self.criterion(warped, fixed)
+                            val_losses.append(loss.item())
+                        else:
+                            output = self.registration(fixed, moving)
+                            displacement = output['displacement']
+                            warped = output['warped']
+                            
+                            # Compute loss
+                            loss, _ = self.criterion(
+                                fixed, moving, displacement, warped, 
+                                output.get('spike_counts', {})
+                            )
+                            val_losses.append(loss.item())
+                            with open(self.log_file, 'a') as f:
+                                f.write(f"Validation output similarity score: {output['similarity_scores'].item()}\n")
+                                f.write(f"Spike counts number: {output['spike_count_history_number']}\n")
+                                if 'hasNaN' in output and output['hasNaN']:
+                                    f.write(f"Warning: Has NaN in displacement or warped, displacement: {output['displacement']}\n")
+                        
+                        # Compute metrics
+                        if 'segmentation_fixed' in batch and 'segmentation_moving' in batch:
+                            seg_fixed = batch['segmentation_fixed'].to(self.device)
+                            seg_moving = batch['segmentation_moving'].to(self.device)
+                            # Warp segmentation labels with nearest neighbor interpolation
+                            seg_warped = self.seg_spatial_transformer(seg_moving.float(), displacement).long()
+                            
+                            # Dice score
+                            dice = dice_score(seg_warped, seg_fixed)
+                            # average over batch and classes to get a single score
+                            val_dice_scores.append(dice.mean().item())
+                        
+                        # Jacobian determinant statistics
+                        jac_stats = jacobian_determinant_stats(displacement)
+                        val_jacobian_stats.append(jac_stats)
         
         # Compute validation metrics
         metrics = {

@@ -142,12 +142,12 @@ class IterativeRegistration(nn.Module):
             hasNaN = True
         
         
-        if return_all_iterations:
+        if return_all_iterations or hasNaN:
             output['displacement_history'] = self.displacement_history
             output['spike_count_history'] = self.spike_count_history
-            output['spike_count_history_number'] = self.spike_count_history_number
             output['similarity_history'] = self.similarity_history
-            output['hasNaN'] = hasNaN
+        output['spike_count_history_number'] = self.spike_count_history_number
+        output['hasNaN'] = hasNaN
         
         return output
 
