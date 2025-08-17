@@ -5,6 +5,7 @@ SpikeReg/data/*
 data/*
 checkpoints/*
 logs/*
+*.pyc
 
 L2R_2021_Task3_validation.zip.1
 oasis_sample_visualization.png
