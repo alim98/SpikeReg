@@ -163,33 +163,51 @@ class SpikeRegUNet(nn.Module):
         # Concatenate fixed and moving images
         x = torch.cat([fixed, moving], dim=1)  # [B, 2, D, H, W]
         
+        # log min max of x
+        x_min = x.min().item()
+        x_max = x.max().item()
+        print(f"[SpikeRegUNet DEBUG] Input range: min={x_min}, max={x_max}")
+
         # Encode to spikes
         spike_input = self.encode_to_spikes(x, self.spike_encoding_window.item())
-        
+
+        # check for NaN
+        if torch.isnan(spike_input).any():
+            print("Warning: NaN detected in spike input tensor!")
+
         # For first encoder, average spikes over time as input
         x_rates = spike_input.mean(dim=1)
         
         # Encoder path
         encoder_features = []
         spike_counts = {}
+        spike_counts_number = {}
         
         for i, encoder in enumerate(self.encoder_blocks):
             spike_tensor, skip_features = encoder(x_rates, self.encoder_time_windows[i])
             encoder_features.append(skip_features)
             x_rates = spike_tensor.mean(dim=1)  # Convert to rates for next layer
             
+            # Check for NaN in spike tensor
+            if torch.isnan(spike_tensor).any():
+                print(f"Warning: NaN detected in encoder_{i} spike tensor!")
+
             # Record spike statistics
             spike_counts[f'encoder_{i}'] = spike_tensor.sum().item() / spike_tensor.numel()
-        
+            spike_counts_number[f'encoder_{i}'] = spike_tensor.sum().cpu().detach().numpy()
         # Bottleneck
         self.bottleneck.reset_neurons()
         bottleneck_spikes = []
         for t in range(self.encoder_time_windows[-1]):
             spikes = self.bottleneck(x_rates)
             bottleneck_spikes.append(spikes)
+            # Check for NaN in bottleneck spikes
+            if torch.isnan(spikes).any():
+                print("Warning: NaN detected in bottleneck spikes!")
         
         x = torch.stack(bottleneck_spikes, dim=1)
         spike_counts['bottleneck'] = x.sum().item() / x.numel()
+        spike_counts_number['bottleneck'] = x.sum().cpu().detach().numpy()
         
         # Decoder path
         decoder_features = []
@@ -201,18 +219,26 @@ class SpikeRegUNet(nn.Module):
                 skip = encoder_features[0]  # Use first encoder features for last decoder
             
             x = decoder(x, skip, self.decoder_time_windows[i])
+            # Check for NaN in decoder output
+            if torch.isnan(x).any():
+                print(f"Warning: NaN detected in decoder_{i} output!")
             decoder_features.append(x.mean(dim=1))
             
             # Record spike statistics
             spike_counts[f'decoder_{i}'] = x.sum().item() / x.numel()
+            spike_counts_number[f'decoder_{i}'] = x.sum().cpu().detach().numpy()
         
         # Output projection
         displacement = self.output_projection(x)
+        # Check for NaN in displacement
+        if torch.isnan(displacement).any():
+            print("Warning: NaN detected in displacement output!")
         
         # Prepare output
         output = {
             'displacement': displacement,
-            'spike_counts': spike_counts
+            'spike_counts': spike_counts,
+            'spike_counts_number': spike_counts_number
         }
         
         if return_features:
@@ -338,6 +364,9 @@ class PretrainedUNet(nn.Module):
         
         # Output
         displacement = self.output(x)
+        #check for NaN in output
+        if torch.isnan(displacement).any():
+            print("Warning: NaN detected in pretrainedUNet output displacement tensor!")
         return displacement
 
 

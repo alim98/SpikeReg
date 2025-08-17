@@ -383,7 +383,10 @@ class SpikeRegLoss(nn.Module):
         total_loss = (self.similarity_weight * sim_loss + 
                      reg_loss + 
                      spike_loss)
-        
+        # check if total_loss is NaN
+        if torch.isnan(total_loss).any():
+            print("Warning! Total loss contains NaN values.")
+            
         # Store components for logging
         loss_components = {
             'similarity': sim_loss,
