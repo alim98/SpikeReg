@@ -47,6 +47,7 @@ class IterativeRegistration(nn.Module):
         self.displacement_history = []
         self.similarity_history = []
         self.spike_count_history = []
+        self.spike_count_history_number = []
     
     def forward(
         self,
@@ -116,8 +117,12 @@ class IterativeRegistration(nn.Module):
             # Store history
             self.displacement_history.append(displacement.clone())
             self.spike_count_history.append(model_output['spike_counts'])
+            self.spike_count_history_number.append(model_output['spike_counts_number'])
             
             num_iters = iteration + 1
+            # check nan values in displacement
+            if torch.isnan(displacement).any():
+                print(f"Warning! NaN detected in displacement at iteration {iteration}.")
         
         # Final warping
         warped_final = self.spatial_transformer(moving, displacement)
@@ -130,10 +135,19 @@ class IterativeRegistration(nn.Module):
             'similarity_scores': torch.tensor(self.similarity_history),
             'converged': converged
         }
+        # check if NaN values are present in displacement and warped
+        hasNaN = False
+        if torch.isnan(displacement).any() or torch.isnan(warped_final).any():
+            print("Warning! Displacement or warped image contains NaN values.")
+            hasNaN = True
+        
         
         if return_all_iterations:
             output['displacement_history'] = self.displacement_history
             output['spike_count_history'] = self.spike_count_history
+            output['spike_count_history_number'] = self.spike_count_history_number
+            output['similarity_history'] = self.similarity_history
+            output['hasNaN'] = hasNaN
         
         return output
 

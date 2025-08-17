@@ -172,6 +172,7 @@ class SpikeRegUNet(nn.Module):
         # Encoder path
         encoder_features = []
         spike_counts = {}
+        spike_counts_number = {}
         
         for i, encoder in enumerate(self.encoder_blocks):
             spike_tensor, skip_features = encoder(x_rates, self.encoder_time_windows[i])
@@ -180,7 +181,7 @@ class SpikeRegUNet(nn.Module):
             
             # Record spike statistics
             spike_counts[f'encoder_{i}'] = spike_tensor.sum().item() / spike_tensor.numel()
-        
+            spike_counts_number[f'encoder_{i}'] = spike_tensor.sum().cpu().numpy()
         # Bottleneck
         self.bottleneck.reset_neurons()
         bottleneck_spikes = []
@@ -190,6 +191,7 @@ class SpikeRegUNet(nn.Module):
         
         x = torch.stack(bottleneck_spikes, dim=1)
         spike_counts['bottleneck'] = x.sum().item() / x.numel()
+        spike_counts_number['bottleneck'] = x.sum().cpu().numpy()
         
         # Decoder path
         decoder_features = []
@@ -205,6 +207,7 @@ class SpikeRegUNet(nn.Module):
             
             # Record spike statistics
             spike_counts[f'decoder_{i}'] = x.sum().item() / x.numel()
+            spike_counts_number[f'decoder_{i}'] = x.sum().cpu().numpy()
         
         # Output projection
         displacement = self.output_projection(x)
@@ -212,7 +215,8 @@ class SpikeRegUNet(nn.Module):
         # Prepare output
         output = {
             'displacement': displacement,
-            'spike_counts': spike_counts
+            'spike_counts': spike_counts,
+            'spike_counts_number': spike_counts_number
         }
         
         if return_features:

@@ -292,7 +292,13 @@ class SpikeRegTrainer:
                 for k, v in loss_dict.items():
                     if torch.is_tensor(v):
                         loss_dict[k] = v.item()
-            
+                # log registration output
+                with open(self.log_file, 'a') as f:
+                    f.write(f"Registration output similarity score for batch {batch_idx}: {output['similarity_scores'].item()}\n")
+                    f.write(f"Spike counts number for batch {batch_idx}: {output['spike_count_history_number']}\n")
+                    if 'hasNaN' in output:
+                        f.write(f"Warning: Has NaN in displacement or warped, displacement: {output['displacement']}\n")
+                            
             # Backward pass
             loss.backward()
             
@@ -360,6 +366,11 @@ class SpikeRegTrainer:
                         output.get('spike_counts', {})
                     )
                     val_losses.append(loss.item())
+                    with open(self.log_file, 'a') as f:
+                        f.write(f"Validation output similarity score: {output['similarity_scores'].item()}\n")
+                        f.write(f"Spike counts number: {output['spike_count_history_number']}\n")
+                        if 'hasNaN' in output:
+                            f.write(f"Warning: Has NaN in displacement or warped, displacement: {output['displacement']}\n")
                 
                 # Compute metrics
                 if 'segmentation_fixed' in batch and 'segmentation_moving' in batch:
