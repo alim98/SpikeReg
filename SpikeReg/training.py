@@ -40,6 +40,10 @@ class SpikeRegTrainer:
         self.checkpoint_dir = checkpoint_dir
         self.log_dir = log_dir
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+
+        # file for writing logs
+        self.log_file = os.path.join(self.log_dir, 'training_log.txt')
+        os.makedirs(self.log_dir, exist_ok=True)
         
         # Multi-GPU configuration
         self.multi_gpu_config = multi_gpu_config or {}
@@ -76,9 +80,6 @@ class SpikeRegTrainer:
         self.spatial_transformer = SpatialTransformer()
         # Transformer for discrete segmentation labels using nearest neighbor
         self.seg_spatial_transformer = SpatialTransformer(mode='nearest', padding_mode='border')
-
-        # file for writing logs
-        self.log_file = os.path.join(self.log_dir, 'training_log.txt')
     
     def _setup_multi_gpu(self):
         """Setup multi-GPU environment"""
