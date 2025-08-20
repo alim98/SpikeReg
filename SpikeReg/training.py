@@ -373,7 +373,7 @@ class SpikeRegTrainer:
                             )
                             val_losses.append(loss.item())
                             with open(self.log_file, 'a') as f:
-                                f.write(f"Validation output similarity score: {output['similarity_scores'].item()}\n")
+                                f.write(f"Validation output similarity score: {output['similarity_scores'].tolist()}\n")
                                 f.write(f"Spike counts number: {output['spike_count_history_number']}\n")
                                 if 'hasNaN' in output and output['hasNaN']:
                                     f.write(f"Warning: Has NaN in displacement or warped, displacement: {output['displacement']}\n")
