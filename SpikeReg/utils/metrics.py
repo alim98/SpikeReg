@@ -46,8 +46,11 @@ def normalized_cross_correlation(
     warped_var = warped_sq - warped_mean ** 2
     covar = fixed_warped - fixed_mean * warped_mean
     
+    # TODO: check if the NaN problem is resolved
+    safe_sqrt = torch.sqrt(torch.clamp(fixed_var, min=0.0) * torch.clamp(warped_var, min=0.0))
+
     # Compute NCC
-    ncc = covar / (torch.sqrt(fixed_var * warped_var) + eps)
+    ncc = covar / (safe_sqrt + eps)
     
     # Average over spatial dimensions
     ncc = ncc.view(B, -1).mean(dim=1)
