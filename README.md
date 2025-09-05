@@ -47,7 +47,7 @@ from spikereg.utils import load_config
 config = load_config("configs/default_config.yaml")
 
 # Initialize model
-model = SpikeRegUNet(config)
+model  = SpikeRegUNet(config['model'])  
 
 # Create trainer
 trainer = SpikeRegTrainer(model, config)

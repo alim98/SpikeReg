@@ -243,9 +243,13 @@ def surface_distance(
     
     seg1_eroded = F.conv3d(seg1_float, kernel, padding=1) < kernel.sum()
     seg2_eroded = F.conv3d(seg2_float, kernel, padding=1) < kernel.sum()
-    
-    surface1 = seg1_float & ~seg1_eroded
-    surface2 = seg2_float & ~seg2_eroded
+    seg1_bool = seg1_float > 0.5
+    seg2_bool = seg2_float > 0.5
+    surface1 = seg1_bool & ~seg1_eroded
+    surface2 = seg2_bool & ~seg2_eroded
+
+    # surface1 = seg1_float & ~seg1_eroded
+    # surface2 = seg2_float & ~seg2_eroded
     
     # Get surface point coordinates
     coords1 = torch.nonzero(surface1.squeeze())
@@ -326,7 +330,8 @@ def structural_similarity_index(
     
     window = g_1d.view(1, 1, -1) * g_1d.view(1, -1, 1) * g_1d.view(-1, 1, 1)
     window = window.unsqueeze(0).unsqueeze(0)
-    
+    window = window.to(img1.device)  # right before the conv3d calls
+
     # Compute statistics
     mu1 = F.conv3d(img1, window, padding=window_size // 2)
     mu2 = F.conv3d(img2, window, padding=window_size // 2)

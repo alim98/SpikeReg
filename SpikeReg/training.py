@@ -11,6 +11,7 @@ import numpy as np
 from tqdm import tqdm
 import os
 from typing import Dict, Optional, Tuple, List
+import argparse
 import yaml
 import json
 from contextlib import redirect_stdout
@@ -607,3 +608,82 @@ def save_config(config: Dict, path: str):
     """Save configuration to YAML file"""
     with open(path, 'w') as f:
         yaml.dump(config, f, default_flow_style=False) 
+
+
+def _create_loaders_from_config(config: Dict) -> Tuple[DataLoader, DataLoader]:
+    """Create OASIS dataloaders based on config paths and settings."""
+    from examples.oasis_dataset import create_oasis_loaders
+
+    data_cfg = config.get('data', {})
+    train_dir = data_cfg.get('train_dir')
+    val_dir = data_cfg.get('val_dir', train_dir)
+    batch_size = int(config.get('training', {}).get('batch_size', 2))
+    patch_size = int(data_cfg.get('patch_size', config.get('model', {}).get('patch_size', 32)))
+    patch_stride = int(data_cfg.get('patch_stride', 16))
+    num_workers = int(config.get('training', {}).get('num_workers', 4))
+
+    # The dataset factory expects data_root to be the parent of L2R_2021_Task3_train
+    # If train_dir is /u/almik/SpikeReg2/data/L2R_2021_Task3_train, then data_root should be /u/almik/SpikeReg2/data
+    if train_dir.endswith('/L2R_2021_Task3_train'):
+        data_root = train_dir[:-len('/L2R_2021_Task3_train')]
+    else:
+        # Fallback: assume train_dir is the data root
+        data_root = train_dir
+
+    train_loader, val_loader = create_oasis_loaders(
+        data_root,
+        batch_size=batch_size,
+        patch_size=patch_size,
+        patch_stride=patch_stride,
+        patches_per_pair=int(config.get('data', {}).get('patches_per_pair', 20)),
+        num_workers=num_workers,
+    )
+
+    return train_loader, val_loader
+
+
+def main_cli():
+    """Minimal CLI to run training using the YAML config without overriding it."""
+    parser = argparse.ArgumentParser(description='SpikeReg Training')
+    parser.add_argument('--config', required=True, help='Path to YAML config')
+    parser.add_argument('--checkpoint_dir', required=True, help='Checkpoint output directory')
+    parser.add_argument('--log_dir', required=True, help='Log output directory')
+    parser.add_argument('--device', default='cuda', help='Device to use (cuda/cpu)')
+    parser.add_argument('--name', help='Run name (ignored, for compatibility)')
+    args = parser.parse_args()
+
+    cfg = load_config(args.config)
+
+    # Build data loaders strictly from config
+    train_loader, val_loader = _create_loaders_from_config(cfg)
+
+    # Multi-GPU config: rely on config flags if present; default to DataParallel via trainer
+    multi_gpu_cfg = cfg.get('multi_gpu', {}) if isinstance(cfg.get('multi_gpu', {}), dict) else {}
+
+    trainer = SpikeRegTrainer(
+        cfg,
+        checkpoint_dir=args.checkpoint_dir,
+        log_dir=args.log_dir,
+        device=args.device,
+        multi_gpu_config=multi_gpu_cfg,
+    )
+
+    # Training phases per config
+    pretrain_epochs = int(cfg.get('training', {}).get('pretrain_epochs', 0))
+    finetune_epochs = int(cfg.get('training', {}).get('finetune_epochs', 0))
+    do_pretrain = bool(cfg.get('training', {}).get('pretrain', True)) and pretrain_epochs > 0
+
+    if do_pretrain and trainer.pretrained_model is not None:
+        trainer.train(train_loader, val_loader, num_epochs=pretrain_epochs)
+        trainer.save_checkpoint('pretrained_model.pth')
+        trainer.convert_to_spiking()
+        trainer.save_checkpoint('converted_model.pth')
+
+    # Fine-tune spiking model
+    if finetune_epochs > 0:
+        trainer.train(train_loader, val_loader, num_epochs=finetune_epochs)
+        trainer.save_checkpoint('final_model.pth')
+
+
+if __name__ == '__main__':
+    main_cli()

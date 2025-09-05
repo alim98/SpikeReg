@@ -1,0 +1,151 @@
+# ============================================
+# SpikeReg — Paper-Faithful Configuration
+# ============================================
+
+# -------- Model architecture --------
+model:
+  # spatial/io
+  patch_size: 32                 # per paper (fits Loihi SRAM)
+  in_channels: 2                 # Fixed + Moving
+  base_channels: 16
+
+  # 4-level UNet as described
+  encoder_channels: [32, 64, 128, 256]
+  decoder_channels: [256, 128, 64, 32]
+
+  # Time windows (encoder decreases, decoder fixed)
+  encoder_time_windows: [10, 8, 6, 4]
+  decoder_time_windows: [4, 4, 4, 4]
+  input_time_window: 10          # Poisson window (ms)
+
+  # LIF dynamics (relative tau_u per level; dt=1 ms in neuromorphic block)
+  encoder_tau_u: [0.9, 0.85, 0.8, 0.75]
+  decoder_tau_u: [0.75, 0.8, 0.85, 0.9]
+
+  # Skip strategy across decoder levels
+  skip_merge: ["concatenate", "concatenate", "average", "none"]
+
+  # Output scaling (voxel units; sampler normalizes internally)
+  displacement_scale: 1.0
+
+# -------- Training configuration --------
+training:
+  # Phases
+  pretrain: true
+  # Iteration targets from paper (use steps if your trainer supports it)
+  pretrain_epochs: 300             # leave 0 if you drive by steps
+  # pretrain_steps: 80000          # paper: ANN warm-start ~80k iters
+  finetune_epochs: 100            # leave 0 if you drive by steps
+  # finetune_steps: 20000          # paper: SNN fine-tune ~20k iters
+
+  # Iterative registration policy
+  num_iterations: 10
+  early_stop_threshold: 0.001
+
+  # Optimizers (separate per phase to match paper)
+  optimizer:
+    type: "adam"                 # paper: Adam
+    lr: 0.0001                   # ANN warm-start LR = 1e-4
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  optimizer_finetune:
+    type: "adam"
+    lr: 0.00005                  # smaller LR for surrogate SNN
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  # Schedulers (cosine decay toward 1e-5 range as in text)
+  scheduler:
+    type: "cosine"
+    T_max: 80000                 # match pretrain_steps if step-based
+    eta_min: 1.0e-5
+    warmup_steps: 0
+  scheduler_finetune:
+    type: "cosine"
+    T_max: 20000
+    eta_min: 1.0e-5
+    warmup_steps: 0
+
+  # Losses (paper: NCC + 1e-3 grad-L2 during pretrain; add spike regularizers in SNN)
+  loss:
+    similarity_type: "ncc"
+    similarity_weight: 1.0
+    ncc_win: 9
+
+    # Use grad_l2 as the primary regularizer (paper)
+    regularization_type: "grad_l2"
+    regularization_weight: 0.001
+
+    # Spike activity shaping (paper: mean-rate term γ=1e-4)
+    spike_weight: 0.0001
+    spike_balance_weight: 0.01
+    target_spike_rate: 0.1
+
+  # Core training settings (paper: batch size 2; clip 1.0)
+  batch_size: 2
+  gradient_clip: 1.0
+  accum_steps: 1
+  num_workers: 8
+  amp: true
+
+  # Logging & checkpoints (sane for 24h restarts)
+  checkpoint_interval: 1000      # in steps
+  log_interval: 100              # in steps
+  val_every_epochs: 0
+  val_every_steps: 2000
+  save_keep_last: 5
+
+  # Data augmentation (modest; paper keeps things simple)
+  augmentation:
+    rotation_range: 10.0
+    scale_range: [0.95, 1.05]
+    translation_range: 2         # voxels (small: 32³ patches)
+    flip_prob: 0.5
+    noise_std: 0.01
+    intensity_shift: 0.1
+    intensity_scale: [0.95, 1.05]
+
+# -------- ANN to SNN conversion --------
+conversion:
+  threshold_percentile: 99.0     # per default/paper
+  calibration_samples: 100
+
+# -------- Inference configuration --------
+inference:
+  patch_size: 32
+  patch_stride: 16               # 50% overlap
+  batch_size: 8                  # light at inference
+  smooth_displacement: true
+  # Whole-volume assembly per paper: Hann + B-spline smoothing
+  smoothing_method: "bspline"
+  bspline_knot_spacing: 32
+
+# -------- Data configuration --------
+data:
+  # Intensity preprocessing
+  percentile_clip: [2, 98]
+
+  # Patch extraction
+  patch_size: 32
+  patch_stride: 16
+
+  # Resample aligned volumes to 128³ as described
+  resample_size: [128, 128, 128]
+
+  # Validation split
+  val_split: 0.2
+
+  # L2R Task 3 (OASIS) paths (update to your layout)
+  train_dir: "/u/almik/SpikeReg2/data/L2R_2021_Task3_train"
+  val_dir:   "/u/almik/SpikeReg2/data/L2R_2021_Task3_val"
+  test_dir:  "/u/almik/SpikeReg2/data/L2R_2021_Task3_val"
+
+# -------- Neuromorphic deployment --------
+neuromorphic:
+  weight_bits: 8
+  threshold_bits: 8
+  cores_per_layer: 4
+  max_spikes_per_core: 1000
+  dt: 1.0                       # ms (matches input_time_window & tau scales)

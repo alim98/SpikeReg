@@ -44,13 +44,14 @@ class SpatialTransformer(nn.Module):
         
         # Add displacement to grid
         # Displacement is in voxel units, need to normalize to [-1, 1]
-        disp_norm = displacement.clone()
-        disp_norm[:, 0] = disp_norm[:, 0] / (D - 1) * 2
-        disp_norm[:, 1] = disp_norm[:, 1] / (H - 1) * 2
-        disp_norm[:, 2] = disp_norm[:, 2] / (W - 1) * 2
         
-        # Apply displacement
+# after (reorder to x,y,z):
+        dx = displacement[:, 2] / (W - 1) * 2  # x
+        dy = displacement[:, 1] / (H - 1) * 2  # y
+        dz = displacement[:, 0] / (D - 1) * 2  # z
+        disp_norm = torch.stack([dx, dy, dz], dim=1)
         new_grid = grid + disp_norm.permute(0, 2, 3, 4, 1)
+
         
         # Warp image
         warped = F.grid_sample(
@@ -163,8 +164,17 @@ class DiffeomorphicTransformer(nn.Module):
         inv_displacement = -displacement.clone()
         
         # Create identity grid
-        grid = SpatialTransformer.create_grid(B, D, H, W, device)
-        identity = grid.permute(0, 4, 1, 2, 3).contiguous()
+        # grid = SpatialTransformer.create_grid(B, D, H, W, device)
+                # replace identity built via create_grid(...) with voxel-space identity
+        zz, yy, xx = torch.meshgrid(
+            torch.arange(D, device=device, dtype=torch.float32),
+            torch.arange(H, device=device, dtype=torch.float32),
+            torch.arange(W, device=device, dtype=torch.float32),
+            indexing='ij'
+        )
+        identity = torch.stack([xx, yy, zz], dim=0).unsqueeze(0)  # [1,3,D,H,W]
+
+        # identity = grid.permute(0, 4, 1, 2, 3).contiguous()
         
         # Fixed-point iteration
         for i in range(max_iterations):
