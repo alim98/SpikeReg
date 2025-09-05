@@ -523,27 +523,51 @@ class SpikeRegTrainer:
         print(f"Saved checkpoint: {path}")
         with open(self.log_file, 'a') as f:
             f.write(f"Saved checkpoint: {path}\n")
-    
     def load_checkpoint(self, filename: str):
         """Load model checkpoint"""
+        import sys, numpy as np
+        # 0) legacy NumPy aliases MUST be defined before torch.load
+        sys.modules.setdefault('numpy._core', np.core)
+        sys.modules.setdefault('numpy._core.multiarray', np.core.multiarray)
+
         path = os.path.join(self.checkpoint_dir, filename)
-        checkpoint = torch.load(path, map_location=self.device)
-        
-        self.epoch = checkpoint['epoch']
-        self.global_step = checkpoint['global_step']
-        self.best_val_loss = checkpoint['best_val_loss']
-        
-        # Load model weights
-        self.current_model.load_state_dict(checkpoint['model_state_dict'])
-        self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        
+        # keep weights_only=False for old pickles (trusted source)
+        checkpoint = torch.load(path, map_location=self.device, weights_only=False)
+
+        # 1) choose the state dict
+        state = checkpoint.get("model_state_dict", checkpoint)
+
+        # 2) strip DataParallel/DDP prefix if present
+        if any(k.startswith("module.") for k in state.keys()):
+            state = {k[len("module."):]: v for k, v in state.items()}
+
+        # 3) load weights ONCE (lenient)
+        missing, unexpected = self.current_model.load_state_dict(state, strict=False)
+        if missing or unexpected:
+            print("[load_checkpoint] missing:", missing)
+            print("[load_checkpoint] unexpected:", unexpected)
+
+        # 4) restore training state (guarded)
+        self.epoch         = int(checkpoint.get('epoch', 0))
+        self.global_step   = int(checkpoint.get('global_step', 0))
+        self.best_val_loss = float(checkpoint.get('best_val_loss', float('inf')))
+
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception as e:
+                print("[load_checkpoint] optimizer state load skipped:", e)
+
         if self.scheduler is not None and 'scheduler_state_dict' in checkpoint:
-            self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        
+            try:
+                self.scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+            except Exception as e:
+                print("[load_checkpoint] scheduler state load skipped:", e)
+
         print(f"Loaded checkpoint from epoch {self.epoch}")
         with open(self.log_file, 'a') as f:
             f.write(f"Loaded checkpoint from epoch {self.epoch}\n")
-    
+
     def _log_training_step(self, loss_dict: Dict[str, float], spike_counts: Dict[str, float]):
         """Log training step to tensorboard"""
         # Log losses

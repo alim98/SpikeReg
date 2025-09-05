@@ -174,7 +174,7 @@ class SpikeRegInference:
         self.batch_size = batch_size
         
         # Load model
-        checkpoint = torch.load(model_path, map_location=self.device)
+        checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         if config is None:
             config = checkpoint.get('config', {})
         

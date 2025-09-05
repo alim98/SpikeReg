@@ -58,12 +58,18 @@ class NormalizedCrossCorrelation(nn.Module):
         fixed_var = fixed_sq - fixed_mean ** 2
         warped_var = warped_sq - warped_mean ** 2
         covar = fixed_warped - fixed_mean * warped_mean
-        
-        # Compute NCC
-        ncc = covar / (torch.sqrt(fixed_var * warped_var) + self.eps)
-        
-        # Return negative NCC for minimization
+        # after computing fixed_var, warped_var, covar
+        eps = self.eps
+        den = torch.sqrt(torch.clamp(fixed_var,  min=0.0) + eps) * \
+            torch.sqrt(torch.clamp(warped_var, min=0.0) + eps)
+
+        ncc = covar / den
+        # (optional) keep numerics sane
+        ncc = torch.clamp(ncc, min=-1.0, max=1.0)
+
+        # Return negative NCC (to minimize)
         return -ncc.mean()
+
 
 
 class MutualInformation(nn.Module):
