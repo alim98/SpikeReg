@@ -266,6 +266,9 @@ class SpikeRegTrainer:
         self.current_model.train()
         epoch_losses = []
         epoch_metrics = {}
+        # Aggregate per-component training loss averages
+        train_loss_component_sums: Dict[str, float] = {}
+        train_loss_component_count: int = 0
         with open(self.log_file, 'a') as f:
             f.write(f"Starting training epoch {self.epoch}\n")
         
@@ -332,6 +335,14 @@ class SpikeRegTrainer:
                     
                     # Update metrics (total is now float)
                     epoch_losses.append(float(loss_dict['total']))
+                    # Aggregate per-component losses
+                    for comp_name, comp_value in loss_dict.items():
+                        try:
+                            value_float = float(comp_value)
+                        except Exception:
+                            continue
+                        train_loss_component_sums[comp_name] = train_loss_component_sums.get(comp_name, 0.0) + value_float
+                    train_loss_component_count += 1
                     
                     # Log to tensorboard
                     if self.global_step % self.config['training'].get('log_interval', 10) == 0:
@@ -344,6 +355,10 @@ class SpikeRegTrainer:
 
         # Compute epoch statistics
         epoch_metrics['loss'] = np.mean(epoch_losses)
+        # Add per-component mean losses for the epoch
+        if train_loss_component_count > 0:
+            for comp_name, comp_sum in train_loss_component_sums.items():
+                epoch_metrics[f'loss_{comp_name}'] = comp_sum / train_loss_component_count
         
         with open(self.log_file, 'a') as f:
             f.write(f"Completed training epoch {self.epoch}\n")
@@ -358,6 +373,9 @@ class SpikeRegTrainer:
         val_losses = []
         val_dice_scores = []
         val_jacobian_stats = []
+        # Aggregate per-component validation loss averages
+        val_loss_component_sums: Dict[str, float] = {}
+        val_loss_component_count: int = 0
         with open(self.log_file, 'a') as f:
             f.write(f"Starting validation epoch {self.epoch}\n")
         
@@ -381,11 +399,19 @@ class SpikeRegTrainer:
                             warped = output['warped']
                             
                             # Compute loss
-                            loss, _ = self.criterion(
+                            loss, val_loss_dict = self.criterion(
                                 fixed, moving, displacement, warped, 
                                 output.get('spike_counts', {})
                             )
                             val_losses.append(loss.item())
+                            # aggregate per-component validation losses if provided
+                            try:
+                                for comp_name, comp_value in val_loss_dict.items():
+                                    value_float = float(comp_value.item() if torch.is_tensor(comp_value) else comp_value)
+                                    val_loss_component_sums[comp_name] = val_loss_component_sums.get(comp_name, 0.0) + value_float
+                                val_loss_component_count += 1
+                            except Exception:
+                                pass
                             with open(self.log_file, 'a') as f:
                                 f.write(f"Validation output similarity score: {output['similarity_scores'].tolist()}\n")
                                 f.write(f"Spike counts number: {output['spike_count_history_number']}\n")
@@ -414,6 +440,10 @@ class SpikeRegTrainer:
             'val_dice': np.mean(val_dice_scores) if val_dice_scores else 0.0,
             'val_jac_negative': np.mean([s['negative_fraction'] for s in val_jacobian_stats])
         }
+        # Add per-component mean validation losses for the epoch
+        if val_loss_component_count > 0:
+            for comp_name, comp_sum in val_loss_component_sums.items():
+                metrics[f'val_loss_{comp_name}'] = comp_sum / val_loss_component_count
 
         with open(self.log_file, 'a') as f:
             f.write(f"Completed validation epoch {self.epoch}\n")
@@ -603,6 +633,7 @@ class SpikeRegTrainer:
         """Log epoch metrics to Aim"""
         # Training metrics
         for name, value in train_metrics.items():
+            # name could be 'loss' or 'loss_total' or 'loss_similarity' etc.
             self.aim_run.track(value, name=f'epoch/train_{name}', step=self.epoch)
 
         # Validation metrics
