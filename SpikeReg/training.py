@@ -292,7 +292,12 @@ class SpikeRegTrainer:
                         
                         # Simple MSE loss
                         loss = self.criterion(warped, fixed)
-                        loss_dict = {'total': loss.item()}
+                        # Log per-component even in pretrain phase
+                        loss_value = float(loss.item())
+                        loss_dict = {
+                            'mse': loss_value,
+                            'total': loss_value,
+                        }
                         spike_counts = {}
                         
                     else:
@@ -392,7 +397,17 @@ class SpikeRegTrainer:
                             displacement = self.current_model(fixed, moving)
                             warped = self.spatial_transformer(moving, displacement)
                             loss = self.criterion(warped, fixed)
-                            val_losses.append(loss.item())
+                            loss_value = float(loss.item())
+                            val_losses.append(loss_value)
+                            # record val components for pretrain
+                            val_loss_dict = {'mse': loss_value, 'total': loss_value}
+                            try:
+                                for comp_name, comp_value in val_loss_dict.items():
+                                    value_float = float(comp_value)
+                                    val_loss_component_sums[comp_name] = val_loss_component_sums.get(comp_name, 0.0) + value_float
+                                val_loss_component_count += 1
+                            except Exception:
+                                pass
                         else:
                             output = self.registration(fixed, moving)
                             displacement = output['displacement']
