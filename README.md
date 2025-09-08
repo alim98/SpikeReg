@@ -1,3 +1,4 @@
+#aim ```aim up --repo /u/almik/SpikeReg5/SpikeReg/checkpoints/spikereg --port 6006```
 # SpikeReg: Energy-Efficient Deformable Medical Image Registration using Spiking Neural Networks
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)

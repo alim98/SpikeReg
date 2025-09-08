@@ -4,11 +4,11 @@
 #SBATCH -o ./slurm/output_spikereg/%j.out
 #SBATCH -J spikereg_training
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=2           # # of processes (DDP)
+#SBATCH --ntasks-per-node=4           # # of processes (DDP)
 #SBATCH --cpus-per-task=16
 #SBATCH --mem=128000
 #SBATCH --constraint=gpu
-#SBATCH --gres=gpu:a100:2
+#SBATCH --gres=gpu:a100:4
 #SBATCH --mail-type=NONE
 #SBATCH --time=24:00:00
 
@@ -18,9 +18,11 @@ set -euo pipefail
 module purge
 module load intel/21.2.0 impi/2021.2
 
-# If your SpikeReg lives in same env as VGG, keep cephclr. Otherwise set SPK_ENV.
+# Activate the conda environment
 source /mpcdf/soft/SLE_15/packages/x86_64/anaconda/3/2023.03/etc/profile.d/conda.sh
-conda activate "${SPK_ENV:-spikereg}" || conda activate cephclr
+# Fix MKL environment variable issue
+export MKL_INTERFACE_LAYER=LP64,GNU
+conda activate cephclr
 
 # --- Python & performance knobs ---
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
@@ -63,14 +65,24 @@ export SPIKEREG_CHECKPOINT_DIR="${RUNDIR}/checkpoints"
 export SPIKEREG_CHECKPOINT_EVERY_STEPS="${SPIKEREG_CHECKPOINT_EVERY_STEPS:-1000}"   # tune
 export SPIKEREG_KEEP_LAST="${SPIKEREG_KEEP_LAST:-5}"
 
+# --- Aim repo (optional): default to repo-level path alongside checkpoints ---
+export AIM_REPO="${AIM_REPO:-${REPO_ROOT}/checkpoints/spikereg}"
+
+# Ensure Aim repo exists and is initialized
+mkdir -p "$AIM_REPO"
+if [[ ! -d "$AIM_REPO/.aim" ]]; then
+  echo "[train_spikereg] Initializing Aim repo at $AIM_REPO"
+  aim init --repo "$AIM_REPO" | cat
+fi
+
 # --- Training entrypoint (adjust if your CLI differs) ---
 # Common patterns:
 #   python -m spikereg.train --config ... [--resume path]
 #   python SpikeReg/training.py --config ... [--resume path]
 # --- Run as a MODULE, not a script path ---
 TRAIN_ENTRY_MODULE=${TRAIN_ENTRY_MODULE:-"SpikeReg.training"}
-# Use a single process; SpikeRegTrainer handles DataParallel internally if enabled
-NP=1
+# Use 4 processes to match 4 GPUs; SpikeRegTrainer handles DataParallel internally if enabled
+NP=4
 
 set -x
 "$PYTHON" -m torch.distributed.run --standalone --nproc_per_node="$NP" \
@@ -80,6 +92,7 @@ set -x
   --config "$CONFIG" \
   --checkpoint_dir "$SPIKEREG_CHECKPOINT_DIR" \
   --log_dir "$RUNDIR/logs" \
+  --aim_repo "$AIM_REPO" \
   "${OTHER_ARGS[@]}" \
   |& tee "$RUNDIR/logs/train_${SLURM_JOB_ID}.log"
 set +x

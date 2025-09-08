@@ -86,7 +86,13 @@ while true; do
 
   case "$state" in
     COMPLETED|TIMEOUT|CANCELLED|FAILED|OUT_OF_MEMORY)
-      echo "[launcher] Restarting SpikeReg…"
+      echo "[launcher] Job finished with state: $state"
+      if [[ -n "$ckpt_path" ]]; then
+        echo "[launcher] Found checkpoint: $ckpt_path"
+        echo "[launcher] Restarting SpikeReg from checkpoint…"
+      else
+        echo "[launcher] No checkpoint found, restarting from scratch…"
+      fi
       sbatch_out=$(submit_job "$ckpt_path")
       echo "$sbatch_out"
       job_id=$(echo "$sbatch_out" | awk '{print $4}')

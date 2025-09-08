@@ -142,6 +142,12 @@ data:
   val_dir:   "/u/almik/SpikeReg2/data/L2R_2021_Task3_val"
   test_dir:  "/u/almik/SpikeReg2/data/L2R_2021_Task3_val"
 
+# -------- Multi-GPU configuration --------
+multi_gpu:
+  use_multi_gpu: true
+  gpu_ids: [0, 1, 2, 3]         # Use all 4 A100 GPUs
+  distributed: false             # Use DataParallel (simpler than DDP)
+
 # -------- Neuromorphic deployment --------
 neuromorphic:
   weight_bits: 8

@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from torch.utils.tensorboard import SummaryWriter
+from aim import Repo, Run
 import numpy as np
 from tqdm import tqdm
 import os
@@ -36,7 +36,8 @@ class SpikeRegTrainer:
         checkpoint_dir: str = "checkpoints",
         log_dir: str = "logs",
         device: str = "cuda",
-        multi_gpu_config: Dict = None
+        multi_gpu_config: Dict = None,
+        aim_repo: Optional[str] = None
     ):
         self.config = config
         self.checkpoint_dir = checkpoint_dir
@@ -60,8 +61,14 @@ class SpikeRegTrainer:
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
         
-        # Initialize tensorboard
-        self.writer = SummaryWriter(log_dir)
+        # Initialize Aim
+        # Priority: explicit arg > env var AIM_REPO > parent of checkpoint_dir
+        self.aim_repo_path = aim_repo or os.getenv("AIM_REPO") or os.path.dirname(self.checkpoint_dir)
+        self.aim_repo = Repo(self.aim_repo_path)
+        self.aim_run = Run(repo=self.aim_repo)
+        self.aim_run["config"] = self.config
+        self.aim_run["checkpoint_dir"] = self.checkpoint_dir
+        self.aim_run["log_dir"] = self.log_dir
         
         # Initialize models
         self.pretrained_model = None
@@ -85,6 +92,12 @@ class SpikeRegTrainer:
     
     def _setup_multi_gpu(self):
         """Setup multi-GPU environment"""
+        print(f"CUDA available: {torch.cuda.is_available()}")
+        print(f"CUDA device count: {torch.cuda.device_count()}")
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+        
         if not self.use_multi_gpu or not torch.cuda.is_available():
             print(f"Training on single device: {self.device}")
             with open(self.log_file, 'a') as f:
@@ -570,31 +583,31 @@ class SpikeRegTrainer:
             f.write(f"Loaded checkpoint from epoch {self.epoch}\n")
 
     def _log_training_step(self, loss_dict: Dict[str, float], spike_counts: Dict[str, float]):
-        """Log training step to tensorboard"""
+        """Log training step to Aim"""
         # Log losses
         for name, value in loss_dict.items():
-            self.writer.add_scalar(f'train/loss_{name}', value, self.global_step)
-        
+            self.aim_run.track(value, name=f'train/loss_{name}', step=self.global_step)
+
         # Log spike counts
         for layer, count in spike_counts.items():
-            self.writer.add_scalar(f'train/spikes_{layer}', count, self.global_step)
-        
+            self.aim_run.track(count, name=f'train/spikes_{layer}', step=self.global_step)
+
         # Log learning rate
         current_lr = self.optimizer.param_groups[0]['lr']
-        self.writer.add_scalar('train/learning_rate', current_lr, self.global_step)
+        self.aim_run.track(current_lr, name='train/learning_rate', step=self.global_step)
 
 
             ### !!!
     
     def _log_epoch_metrics(self, train_metrics: Dict[str, float], val_metrics: Dict[str, float]):
-        """Log epoch metrics to tensorboard"""
+        """Log epoch metrics to Aim"""
         # Training metrics
         for name, value in train_metrics.items():
-            self.writer.add_scalar(f'epoch/train_{name}', value, self.epoch)
-        
+            self.aim_run.track(value, name=f'epoch/train_{name}', step=self.epoch)
+
         # Validation metrics
         for name, value in val_metrics.items():
-            self.writer.add_scalar(f'epoch/{name}', value, self.epoch)
+            self.aim_run.track(value, name=f'epoch/{name}', step=self.epoch)
 
 
 def load_config(config_path: str) -> Dict:
@@ -650,6 +663,8 @@ def main_cli():
     parser.add_argument('--log_dir', required=True, help='Log output directory')
     parser.add_argument('--device', default='cuda', help='Device to use (cuda/cpu)')
     parser.add_argument('--name', help='Run name (ignored, for compatibility)')
+    parser.add_argument('--start_from_checkpoint', help='Path to checkpoint to resume from')
+    parser.add_argument('--aim_repo', type=str, default=None, help='Path to Aim repository (overrides AIM_REPO env)')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -666,7 +681,14 @@ def main_cli():
         log_dir=args.log_dir,
         device=args.device,
         multi_gpu_config=multi_gpu_cfg,
+        aim_repo=args.aim_repo,
     )
+
+    # Resume from checkpoint if provided
+    if args.start_from_checkpoint:
+        print(f"Resuming from checkpoint: {args.start_from_checkpoint}")
+        trainer.load_checkpoint(args.start_from_checkpoint)
+        print(f"Resumed from epoch {trainer.epoch}")
 
     # Training phases per config
     pretrain_epochs = int(cfg.get('training', {}).get('pretrain_epochs', 0))
