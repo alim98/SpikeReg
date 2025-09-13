@@ -5,8 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # Repo root is the directory containing this script (SpikeReg)
 REPO_ROOT="$SCRIPT_DIR"
 
-JOB_SCRIPT="${JOB_SCRIPT:-$SCRIPT_DIR/train_spikereg.sh}"
-RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/checkpoints/spikereg/runs}"
+JOB_SCRIPT="${JOB_SCRIPT:-$SCRIPT_DIR/train_spikeregtest.sh}"
+RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/checkpoints/test/runs}"
 CONFIG_DEFAULT="${CONFIG_DEFAULT:-$REPO_ROOT/configs/spikereg_oasis_new_config.yaml}"
 
 RUN_TAG="${RUN_TAG:-$(date +"%Y%m%d-%H%M%S")}"
@@ -27,38 +27,11 @@ done
 
 latest_ckpt_in() {
   local dir="$1"
-  local ckpt_dir="$dir/checkpoints"
-  
-  if [[ ! -d "$ckpt_dir" ]]; then
-    # Fallback to old behavior if no checkpoints dir
+  if [[ -d "$dir/checkpoints" ]]; then
+    find "$dir/checkpoints" -type f \( -name '*.pt' -o -name '*.pth' \) -printf "%T@ %p\n" | sort -nr | head -n1 | awk '{print $2}'
+  else
     find "$dir" -type f -iname '*ckpt*' -printf "%T@ %p\n" | sort -nr | head -n1 | awk '{print $2}'
-    return
   fi
-  
-  # Find step-based checkpoints first (highest priority)
-  local step_ckpt
-  step_ckpt=$(find "$ckpt_dir" -name 'model_step_*.pth' -type f | \
-    sed 's/.*model_step_\([0-9]\+\)\.pth/\1 &/' | \
-    sort -nr | head -n1 | awk '{print $2}')
-  
-  if [[ -n "$step_ckpt" ]]; then
-    echo "$step_ckpt"
-    return
-  fi
-  
-  # Fall back to epoch-based checkpoints
-  local epoch_ckpt
-  epoch_ckpt=$(find "$ckpt_dir" -name 'model_epoch_*.pth' -type f | \
-    sed 's/.*model_epoch_\([0-9]\+\)\.pth/\1 &/' | \
-    sort -nr | head -n1 | awk '{print $2}')
-  
-  if [[ -n "$epoch_ckpt" ]]; then
-    echo "$epoch_ckpt"
-    return
-  fi
-  
-  # Final fallback to any checkpoint by timestamp
-  find "$ckpt_dir" -type f \( -name '*.pt' -o -name '*.pth' \) -printf "%T@ %p\n" | sort -nr | head -n1 | awk '{print $2}'
 }
 
 job_state() {
@@ -91,13 +64,27 @@ if [[ -n "$START_FROM" ]]; then
   initial_ckpt="$START_FROM"
 fi
 
+# Set test duration limit (1 hour = 3600 seconds)
+TEST_START_TIME=$(date +%s)
+TEST_DURATION_LIMIT=3600
+
 sbatch_out=$(submit_job "$initial_ckpt" "$CONFIG")
 echo "$sbatch_out"
 job_id=$(echo "$sbatch_out" | awk '{print $4}')
 echo "[launcher] Job ID: $job_id"
 echo "[launcher] REPO_ROOT=$REPO_ROOT RUN_ROOT=$RUN_ROOT JOB_SCRIPT=$JOB_SCRIPT"
+echo "[launcher] Test started at $(date), will run for maximum 1 hour"
 
 while true; do
+  # Check if we've exceeded the test duration
+  current_time=$(date +%s)
+  elapsed_time=$((current_time - TEST_START_TIME))
+  if [[ $elapsed_time -gt $TEST_DURATION_LIMIT ]]; then
+    echo "[launcher] Test duration limit reached (1 hour). Canceling current job and exiting."
+    scancel "$job_id" 2>/dev/null || true
+    echo "[launcher] Test completed after $((elapsed_time / 60)) minutes"
+    break
+  fi
   sleep 30
   state=$(job_state "$job_id")
   while [[ "$state" == "PENDING" || "$state" == "CONFIGURING" || "$state" == "RUNNING" || "$state" == "COMPLETING" ]]; do
@@ -113,6 +100,16 @@ while true; do
   ckpt_path="$(latest_ckpt_in "$JOB_DIR" || true)"
   case "$state" in
     COMPLETED|TIMEOUT|CANCELLED|FAILED|OUT_OF_MEMORY|PREEMPTED|NODE_FAIL)
+      # Check time limit before submitting new job
+      current_time=$(date +%s)
+      elapsed_time=$((current_time - TEST_START_TIME))
+      if [[ $elapsed_time -gt $TEST_DURATION_LIMIT ]]; then
+        echo "[launcher] Test duration limit reached. Not submitting new job."
+        echo "[launcher] Test completed after $((elapsed_time / 60)) minutes"
+        break
+      fi
+      
+      echo "[launcher] Submitting new job with checkpoint: ${ckpt_path:-none}"
       sbatch_out=$(submit_job "${ckpt_path:-}" "$CONFIG")
       echo "$sbatch_out"
       job_id=$(echo "$sbatch_out" | awk '{print $4}')

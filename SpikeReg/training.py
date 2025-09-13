@@ -353,6 +353,12 @@ class SpikeRegTrainer:
                     if self.global_step % self.config['training'].get('log_interval', 10) == 0:
                         self._log_training_step(loss_dict, spike_counts)
                     
+                    # Step-based checkpoint saving (for frequent saves during testing)
+                    checkpoint_every_steps = int(os.getenv('SPIKEREG_CHECKPOINT_EVERY_STEPS', 0))
+                    if checkpoint_every_steps > 0 and self.global_step % checkpoint_every_steps == 0:
+                        self.save_checkpoint(f'model_step_{self.global_step}.pth')
+                        print(f"Saved step checkpoint at step {self.global_step}")
+                    
                     # Update progress bar
                     progress_bar.set_postfix(loss=loss_dict['total'])
                     
@@ -589,7 +595,13 @@ class SpikeRegTrainer:
         sys.modules.setdefault('numpy._core', np.core)
         sys.modules.setdefault('numpy._core.multiarray', np.core.multiarray)
 
-        path = os.path.join(self.checkpoint_dir, filename)
+        # Handle both relative and absolute paths
+        if os.path.isabs(filename):
+            path = filename
+        else:
+            path = os.path.join(self.checkpoint_dir, filename)
+        
+        print(f"Loading checkpoint from: {path}")
         # keep weights_only=False for old pickles (trusted source)
         checkpoint = torch.load(path, map_location=self.device, weights_only=False)
 
@@ -623,9 +635,9 @@ class SpikeRegTrainer:
             except Exception as e:
                 print("[load_checkpoint] scheduler state load skipped:", e)
 
-        print(f"Loaded checkpoint from epoch {self.epoch}")
+        print(f"Loaded checkpoint from epoch {self.epoch}, global_step {self.global_step}")
         with open(self.log_file, 'a') as f:
-            f.write(f"Loaded checkpoint from epoch {self.epoch}\n")
+            f.write(f"Loaded checkpoint from epoch {self.epoch}, global_step {self.global_step}\n")
 
     def _log_training_step(self, loss_dict: Dict[str, float], spike_counts: Dict[str, float]):
         """Log training step to Aim"""

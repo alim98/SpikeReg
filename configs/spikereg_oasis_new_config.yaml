@@ -84,14 +84,14 @@ training:
     target_spike_rate: 0.1
 
   # Core training settings (paper: batch size 2; clip 1.0)
-  batch_size: 2
+  batch_size: 16
   gradient_clip: 1.0
   accum_steps: 1
   num_workers: 8
   amp: true
 
   # Logging & checkpoints (sane for 24h restarts)
-  checkpoint_interval: 1000      # in steps
+  checkpoint_interval: 5      # in steps
   log_interval: 100              # in steps
   val_every_epochs: 0
   val_every_steps: 2000

@@ -1,8 +1,8 @@
 #!/bin/bash -l
 # --- Slurm header ---
 #SBATCH -D ./
-#SBATCH -o ./slurm/output_spikereg/%j.out
-#SBATCH -J spikereg_training
+#SBATCH -o ./slurm/output_test/%j.out
+#SBATCH -J spikereg_test
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4           # # of processes (DDP)
 #SBATCH --cpus-per-task=16
@@ -10,7 +10,7 @@
 #SBATCH --constraint=gpu
 #SBATCH --gres=gpu:a100:4
 #SBATCH --mail-type=NONE
-#SBATCH --time=24:00:00
+#SBATCH --time=00:15:00
 
 set -euo pipefail
 
@@ -56,22 +56,22 @@ cd "$REPO_ROOT"
 export PYTHONPATH="$REPO_ROOT:${PYTHONPATH:-}"
 
 # --- Run dir & logging (absolute paths to avoid cwd confusion) ---
-RUNDIR="$REPO_ROOT/checkpoints/spikereg/runs/${SLURM_JOB_ID}"
+RUNDIR="$REPO_ROOT/checkpoints/test/runs/${SLURM_JOB_ID}"
 mkdir -p "$RUNDIR/logs" "$RUNDIR/checkpoints"
-ln -sfn "$RUNDIR" "$REPO_ROOT/checkpoints/spikereg/runs/latest_job"
+ln -sfn "$RUNDIR" "$REPO_ROOT/checkpoints/test/runs/latest_job"
 
 # --- Safety: checkpoint often (so restart has fresh state) ---
 export SPIKEREG_CHECKPOINT_DIR="${RUNDIR}/checkpoints"
-export SPIKEREG_CHECKPOINT_EVERY_STEPS="${SPIKEREG_CHECKPOINT_EVERY_STEPS:-1000}"   # tune
+export SPIKEREG_CHECKPOINT_EVERY_STEPS="${SPIKEREG_CHECKPOINT_EVERY_STEPS:-2}"   # very frequent checkpoints for testing
 export SPIKEREG_KEEP_LAST="${SPIKEREG_KEEP_LAST:-5}"
 
 # --- Aim repo (optional): default to repo-level path alongside checkpoints ---
-export AIM_REPO="${AIM_REPO:-${REPO_ROOT}/checkpoints/spikereg}"
+export AIM_REPO="${AIM_REPO:-${REPO_ROOT}/checkpoints/test}"
 
 # Ensure Aim repo exists and is initialized
 mkdir -p "$AIM_REPO"
 if [[ ! -d "$AIM_REPO/.aim" ]]; then
-  echo "[train_spikereg] Initializing Aim repo at $AIM_REPO"
+  echo "[train_spikeregtest] Initializing Aim repo at $AIM_REPO"
   aim init --repo "$AIM_REPO" | cat
 fi
 
