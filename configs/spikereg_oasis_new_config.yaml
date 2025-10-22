@@ -30,12 +30,12 @@ model:
 
 # -------- Training configuration --------
 training:
-  # Phases
+  # Phases - run until timeout, no epoch limits
   pretrain: true
   # Iteration targets from paper (use steps if your trainer supports it)
-  pretrain_epochs: 300             # leave 0 if you drive by steps
+  pretrain_epochs: 100             # 0 = run until timeout
   # pretrain_steps: 80000          # paper: ANN warm-start ~80k iters
-  finetune_epochs: 100            # leave 0 if you drive by steps
+  finetune_epochs: 100            # 0 = run until timeout
   # finetune_steps: 20000          # paper: SNN fine-tune ~20k iters
 
   # Iterative registration policy
@@ -56,15 +56,15 @@ training:
     betas: [0.9, 0.999]
     eps: 1.0e-8
 
-  # Schedulers (cosine decay toward 1e-5 range as in text)
+  # Schedulers (epoch-based for proper continuation)
   scheduler:
     type: "cosine"
-    T_max: 80000                 # match pretrain_steps if step-based
+    T_max: 999999                # large number for indefinite training
     eta_min: 1.0e-5
     warmup_steps: 0
   scheduler_finetune:
     type: "cosine"
-    T_max: 20000
+    T_max: 999999
     eta_min: 1.0e-5
     warmup_steps: 0
 
@@ -90,11 +90,9 @@ training:
   num_workers: 8
   amp: true
 
-  # Logging & checkpoints (sane for 24h restarts)
-  checkpoint_interval: 5      # in steps
-  log_interval: 100              # in steps
-  val_every_epochs: 0
-  val_every_steps: 2000
+  # Logging & checkpoints (epoch-based for proper continuation)
+  checkpoint_interval: 1      # every epoch
+  val_every_epochs: 1         # validate every epoch
   save_keep_last: 5
 
   # Data augmentation (modest; paper keeps things simple)

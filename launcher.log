@@ -1,0 +1,9 @@
+[launcher] Submitting job without checkpoint (fresh start)
+Submitted batch job 22434549
+[launcher] Extracted Job ID: 22434549
+[launcher] REPO_ROOT=/u/almik/SpikeReg5/SpikeReg RUN_ROOT=/u/almik/SpikeReg5/SpikeReg/checkpoints/spikereg/runs JOB_SCRIPT=/u/almik/SpikeReg5/SpikeReg/train_spikereg.sh
+[launcher] Job 22434549 finished with state: FAILED
+[launcher] No checkpoint found in /u/almik/SpikeReg5/SpikeReg/checkpoints/spikereg/runs/22434549
+[launcher] Submitting job without checkpoint (fresh start)
+Submitted batch job 22434561
+[launcher] Extracted New Job ID: 22434561
