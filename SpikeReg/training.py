@@ -6,7 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
-from aim import Repo, Run
+# from aim import Repo, Run
 import numpy as np
 from tqdm import tqdm
 import os
@@ -40,8 +40,8 @@ class SpikeRegTrainer:
         aim_repo: Optional[str] = None
     ):
         self.config = config
-        self.checkpoint_dir = checkpoint_dir
-        self.log_dir = log_dir
+        self.checkpoint_dir = "checkpoints/oasis"#checkpoint_dir
+        self.log_dir = "logs"#log_dir
         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
 
         # file for writing logs
@@ -58,14 +58,14 @@ class SpikeRegTrainer:
         self._setup_multi_gpu()
         
         # Create directories
-        os.makedirs(checkpoint_dir, exist_ok=True)
-        os.makedirs(log_dir, exist_ok=True)
+        os.makedirs("checkpoints/oasis", exist_ok=True)
+        os.makedirs("logs", exist_ok=True)
         
         # Initialize Aim
         # Priority: explicit arg > env var AIM_REPO > parent of checkpoint_dir
         self.aim_repo_path = aim_repo or os.getenv("AIM_REPO") or os.path.dirname(self.checkpoint_dir)
-        self.aim_repo = Repo(self.aim_repo_path)
-        self.aim_run = Run(repo=self.aim_repo)
+        self.aim_repo = None#Repo(self.aim_repo_path)
+        self.aim_run = {}#Run(repo=self.aim_repo)
         self.aim_run["config"] = self.config
         self.aim_run["checkpoint_dir"] = self.checkpoint_dir
         self.aim_run["log_dir"] = self.log_dir
@@ -178,7 +178,7 @@ class SpikeRegTrainer:
             # Initialize spiking model directly
             self.spiking_model = SpikeRegUNet(self.config['model']).to(self.device)
             # Wrap for multi-GPU if enabled
-            self.spiking_model = self._wrap_model_for_multi_gpu(self.spiking_model)
+            # self.spiking_model = self._wrap_model_for_multi_gpu(self.spiking_model)
             self.current_model = self.spiking_model
             
             # Create iterative registration wrapper
@@ -617,6 +617,7 @@ class SpikeRegTrainer:
         if missing or unexpected:
             print("[load_checkpoint] missing:", missing)
             print("[load_checkpoint] unexpected:", unexpected)
+            exit(1)
 
         # 4) restore training state (guarded)
         self.epoch         = int(checkpoint.get('epoch', 0))

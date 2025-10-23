@@ -73,6 +73,7 @@ class IterativeRegistration(nn.Module):
                 - similarity_scores: Similarity at each iteration
                 - converged: Whether early stopping occurred
         """
+        print(fixed.shape)
         B, _, D, H, W = fixed.shape
         device = fixed.device
         
@@ -178,10 +179,30 @@ class SpikeRegInference:
         if config is None:
             config = checkpoint.get('config', {})
         
-        self.model = SpikeRegUNet(config).to(self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.eval()
+        self.model = SpikeRegUNet(config['model']).to(self.device)
+        # self.model.load_state_dict(checkpoint['model_state_dict'])
+        # self.model.eval()
         
+        
+        state = checkpoint.get("model_state_dict", checkpoint)
+
+        # 2) strip DataParallel/DDP prefix if present
+        if any(k.startswith("module.") for k in state.keys()):
+            state = {k[len("module."):]: v for k, v in state.items()}
+        # self.model.load_state_dict(state)
+
+
+        # print(f"Loading checkpoint from: {checkpoint_path}")
+        # checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+        # config = checkpoint.get('config', None)
+        # state_dict = checkpoint.get('model_state_dict', checkpoint)
+        
+        # Remove 'module.' prefix if present (from DataParallel)
+        if any(k.startswith('module.') for k in state.keys()):
+            state = {k.replace('module.', ''): v for k, v in state.items()}
+        
+        self.model.load_state_dict(state)
+
         # Create iterative registration module
         self.registration = IterativeRegistration(
             self.model,
@@ -277,7 +298,8 @@ class SpikeRegInference:
                 moving_batch = torch.stack(moving_patches[i:batch_end])
                 
                 # Run registration
-                output = self.registration(fixed_batch, moving_batch)
+                print(fixed_batch.shape)
+                output = self.registration(fixed_batch.squeeze(0), moving_batch.squeeze(0))
                 
                 # Store results
                 all_displacements.extend(output['displacement'].cpu())

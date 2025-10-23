@@ -42,6 +42,7 @@ class SpikeRegUNet(nn.Module):
         
         # Skip connection merge strategies
         self.skip_merge = config.get('skip_merge', ['concatenate', 'average', 'concatenate', 'none'])
+        # self.skip_merge = ['none', 'average', 'none', 'none']
         
         # Build encoder
         self.encoder_blocks = nn.ModuleList()
@@ -73,9 +74,11 @@ class SpikeRegUNet(nn.Module):
         
         # Build decoder
         self.decoder_blocks = nn.ModuleList()
+        print(self.decoder_channels)
         for i in range(len(self.decoder_channels)):
             # Decoder receives features from encoder level -(i+1)
-            in_ch = self.encoder_channels[-(i+1)]
+            # in_ch = self.encoder_channels[-(i+1)]
+            in_ch = self.decoder_channels[i-1] if i > 0 else self.encoder_channels[-1]
             
             # Determine expected skip channels based on forward logic:
             #   skip_idx = -(i+2) if within range else encoder_features[0]
@@ -83,8 +86,11 @@ class SpikeRegUNet(nn.Module):
                 skip_ch = self.encoder_channels[-(i+2)]
             else:
                 skip_ch = self.encoder_channels[0]  # Fallback to first encoder level
+            skip_ch = self.encoder_channels[(-(i+2)+len(self.encoder_channels))%len(self.encoder_channels)]
             
             out_ch = self.decoder_channels[i]
+            # out_ch = self.decoder_channels[i+1] if i + 1 < len(self.decoder_channels) else 32
+            print(f"Decoder {i}: in_ch={in_ch}, skip_ch={skip_ch}, out_ch={out_ch}")
             
             block = SpikingDecoderBlock(
                 in_channels=in_ch,
@@ -162,13 +168,15 @@ class SpikeRegUNet(nn.Module):
         """
         # Concatenate fixed and moving images
         x = torch.cat([fixed, moving], dim=1)  # [B, 2, D, H, W]
-        
+        print("x shape: ", x.shape)
         # log min max of x
         x_min = x.min().item()
         x_max = x.max().item()
         print(f"[SpikeRegUNet DEBUG] Input range: min={x_min}, max={x_max}")
 
         # Encode to spikes
+        # print(self.spike_encoding_window)
+        # self.spike_encoding_window=torch.tensor(100)
         spike_input = self.encode_to_spikes(x, self.spike_encoding_window.item())
 
         # check for NaN
@@ -210,14 +218,18 @@ class SpikeRegUNet(nn.Module):
         spike_counts_number['bottleneck'] = x.sum().cpu().detach().numpy()
         
         # Decoder path
+        print("bottleneck x shape:", x.shape)
+        for i, encf in enumerate(encoder_features):
+            print(f"encoder_features[{i}].shape:", encf.shape)
         decoder_features = []
         for i, decoder in enumerate(self.decoder_blocks):
+            print(f"inside decoder{i}")
             skip_idx = -(i+2)
             if skip_idx >= -len(encoder_features):
                 skip = encoder_features[skip_idx]
             else:
                 skip = encoder_features[0]  # Use first encoder features for last decoder
-            
+            # print(skip)
             x = decoder(x, skip, self.decoder_time_windows[i])
             # Check for NaN in decoder output
             if torch.isnan(x).any():
