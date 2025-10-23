@@ -37,7 +37,8 @@ class SpikeRegTrainer:
         log_dir: str = "logs",
         device: str = "cuda",
         multi_gpu_config: Dict = None,
-        aim_repo: Optional[str] = None
+        aim_repo: Optional[str] = None,
+        run_name: Optional[str] = None,
     ):
         self.config = config
         self.checkpoint_dir = "checkpoints/oasis"#checkpoint_dir
@@ -61,23 +62,51 @@ class SpikeRegTrainer:
         os.makedirs("checkpoints/oasis", exist_ok=True)
         os.makedirs("logs", exist_ok=True)
         
-        # Initialize Aim
-        # Priority: explicit arg > env var AIM_REPO > parent of checkpoint_dir
-        self.aim_repo_path = aim_repo or os.getenv("AIM_REPO") or os.path.dirname(self.checkpoint_dir)
-        self.aim_repo = None#Repo(self.aim_repo_path)
-        self.aim_run = {}#Run(repo=self.aim_repo)
-        self.aim_run["config"] = self.config
-        self.aim_run["checkpoint_dir"] = self.checkpoint_dir
-        self.aim_run["log_dir"] = self.log_dir
+        # Initialize Aim only on main process
+        # Consider environments spawned via torch.distributed.run
+        local_rank = os.getenv("LOCAL_RANK")
+        rank = os.getenv("RANK")
+        is_main_process = True
+        if local_rank is not None and local_rank != '0':
+            is_main_process = False
+        if rank is not None and rank != '0':
+            is_main_process = False
+
+        self.aim_run = None
+        if is_main_process:
+            # Priority: explicit arg > env var AIM_REPO > parent of checkpoint_dir
+            self.aim_repo_path = aim_repo or os.getenv("AIM_REPO") or os.path.dirname(self.checkpoint_dir)
+            self.aim_repo = Repo(self.aim_repo_path)
+            self.aim_run = Run(repo=self.aim_repo)
+            self.aim_run["config"] = self.config
+            self.aim_run["checkpoint_dir"] = self.checkpoint_dir
+            self.aim_run["log_dir"] = self.log_dir
+            # Set run name to job id if provided/available
+            effective_run_name = run_name or os.getenv("SLURM_JOB_ID")
+            if effective_run_name:
+                try:
+                    # Aim SDK may support setting a user-defined name
+                    self.aim_run.name = str(effective_run_name)
+                except Exception:
+                    # Fallback to a tracked field
+                    self.aim_run["run_name"] = str(effective_run_name)
+            # Always store job id field if present
+            if os.getenv("SLURM_JOB_ID"):
+                self.aim_run["job_id"] = os.getenv("SLURM_JOB_ID")
+        else:
+            with open(self.log_file, 'a') as f:
+                f.write("Aim logging disabled on non-main process (rank/LOCAL_RANK != 0)\n")
+        
+        # Store run hash for continuation
+        self.aim_run_hash = None
         
         # Initialize models
         self.pretrained_model = None
         self.spiking_model = None
         self.current_model = None
         
-        # Training state
+        # Training state (epoch-based only)
         self.epoch = 0
-        self.global_step = 0
         self.best_val_loss = float('inf')
         
         # Initialize components
@@ -349,20 +378,8 @@ class SpikeRegTrainer:
                         train_loss_component_sums[comp_name] = train_loss_component_sums.get(comp_name, 0.0) + value_float
                     train_loss_component_count += 1
                     
-                    # Log to tensorboard
-                    if self.global_step % self.config['training'].get('log_interval', 10) == 0:
-                        self._log_training_step(loss_dict, spike_counts)
-                    
-                    # Step-based checkpoint saving (for frequent saves during testing)
-                    checkpoint_every_steps = int(os.getenv('SPIKEREG_CHECKPOINT_EVERY_STEPS', 0))
-                    if checkpoint_every_steps > 0 and self.global_step % checkpoint_every_steps == 0:
-                        self.save_checkpoint(f'model_step_{self.global_step}.pth')
-                        print(f"Saved step checkpoint at step {self.global_step}")
-                    
                     # Update progress bar
                     progress_bar.set_postfix(loss=loss_dict['total'])
-                    
-                    self.global_step += 1
 
         # Compute epoch statistics
         epoch_metrics['loss'] = np.mean(epoch_losses)
@@ -482,10 +499,15 @@ class SpikeRegTrainer:
         """Main training loop"""
         print(f"Training on {self.device}")
 
-        with open(self.log_file, 'a') as f:
-            f.write(f"Starting training for {num_epochs} epochs\n")
+        # Continue from the NEXT epoch if resuming (current epoch is already completed)
+        start_epoch = self.epoch + 1
+        if self.epoch >= 0:
+            print(f"📊 Resuming training from epoch {start_epoch} (checkpoint was saved after completing epoch {self.epoch})")
         
-        for epoch in range(num_epochs):
+        with open(self.log_file, 'a') as f:
+            f.write(f"Resuming training from epoch {start_epoch} (completed epoch {self.epoch}), continuing to {num_epochs}\n")
+        
+        for epoch in range(start_epoch, num_epochs):
             self.epoch = epoch
             
             # Training epoch
@@ -573,11 +595,11 @@ class SpikeRegTrainer:
         """Save model checkpoint"""
         checkpoint = {
             'epoch': self.epoch,
-            'global_step': self.global_step,
             'model_state_dict': self.current_model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
-            'config': self.config
+            'config': self.config,
+            'aim_run_hash': self.aim_run.hash if hasattr(self.aim_run, 'hash') else None,
         }
         
         if self.scheduler is not None:
@@ -621,7 +643,6 @@ class SpikeRegTrainer:
 
         # 4) restore training state (guarded)
         self.epoch         = int(checkpoint.get('epoch', 0))
-        self.global_step   = int(checkpoint.get('global_step', 0))
         self.best_val_loss = float(checkpoint.get('best_val_loss', float('inf')))
 
         if 'optimizer_state_dict' in checkpoint:
@@ -636,29 +657,22 @@ class SpikeRegTrainer:
             except Exception as e:
                 print("[load_checkpoint] scheduler state load skipped:", e)
 
-        print(f"Loaded checkpoint from epoch {self.epoch}, global_step {self.global_step}")
+        print(f"Loaded checkpoint from epoch {self.epoch}")
         with open(self.log_file, 'a') as f:
-            f.write(f"Loaded checkpoint from epoch {self.epoch}, global_step {self.global_step}\n")
+            f.write(f"Loaded checkpoint from epoch {self.epoch}\n")
+        
+        # Store parent run hash as a field for traceability (avoid unsupported reopen-by-hash)
+        if self.aim_run is not None and 'aim_run_hash' in checkpoint and checkpoint['aim_run_hash']:
+            try:
+                self.aim_run["parent_run_hash"] = str(checkpoint['aim_run_hash'])
+            except Exception:
+                pass
 
-    def _log_training_step(self, loss_dict: Dict[str, float], spike_counts: Dict[str, float]):
-        """Log training step to Aim"""
-        # Log losses
-        for name, value in loss_dict.items():
-            self.aim_run.track(value, name=f'train/loss_{name}', step=self.global_step)
-
-        # Log spike counts
-        for layer, count in spike_counts.items():
-            self.aim_run.track(count, name=f'train/spikes_{layer}', step=self.global_step)
-
-        # Log learning rate
-        current_lr = self.optimizer.param_groups[0]['lr']
-        self.aim_run.track(current_lr, name='train/learning_rate', step=self.global_step)
-
-
-            ### !!!
     
     def _log_epoch_metrics(self, train_metrics: Dict[str, float], val_metrics: Dict[str, float]):
         """Log epoch metrics to Aim"""
+        if self.aim_run is None:
+            return
         # Training metrics
         for name, value in train_metrics.items():
             # name could be 'loss' or 'loss_total' or 'loss_similarity' etc.
@@ -667,6 +681,10 @@ class SpikeRegTrainer:
         # Validation metrics
         for name, value in val_metrics.items():
             self.aim_run.track(value, name=f'epoch/{name}', step=self.epoch)
+        
+        # Log learning rate
+        current_lr = self.optimizer.param_groups[0]['lr']
+        self.aim_run.track(current_lr, name='epoch/learning_rate', step=self.epoch)
 
 
 def load_config(config_path: str) -> Dict:
@@ -721,7 +739,7 @@ def main_cli():
     parser.add_argument('--checkpoint_dir', required=True, help='Checkpoint output directory')
     parser.add_argument('--log_dir', required=True, help='Log output directory')
     parser.add_argument('--device', default='cuda', help='Device to use (cuda/cpu)')
-    parser.add_argument('--name', help='Run name (ignored, for compatibility)')
+    parser.add_argument('--name', help='Run name (e.g., SLURM job id)')
     parser.add_argument('--start_from_checkpoint', help='Path to checkpoint to resume from')
     parser.add_argument('--aim_repo', type=str, default=None, help='Path to Aim repository (overrides AIM_REPO env)')
     args = parser.parse_args()
@@ -741,6 +759,7 @@ def main_cli():
         device=args.device,
         multi_gpu_config=multi_gpu_cfg,
         aim_repo=args.aim_repo,
+        run_name=args.name,
     )
 
     # Resume from checkpoint if provided
@@ -752,18 +771,24 @@ def main_cli():
     # Training phases per config
     pretrain_epochs = int(cfg.get('training', {}).get('pretrain_epochs', 0))
     finetune_epochs = int(cfg.get('training', {}).get('finetune_epochs', 0))
-    do_pretrain = bool(cfg.get('training', {}).get('pretrain', True)) and pretrain_epochs > 0
+    do_pretrain = bool(cfg.get('training', {}).get('pretrain', True))
 
-    if do_pretrain and trainer.pretrained_model is not None:
-        trainer.train(train_loader, val_loader, num_epochs=pretrain_epochs)
-        trainer.save_checkpoint('pretrained_model.pth')
-        trainer.convert_to_spiking()
-        trainer.save_checkpoint('converted_model.pth')
+    # If epochs=0, run indefinitely until timeout
+    if pretrain_epochs == 0 and finetune_epochs == 0:
+        print("Running training indefinitely until timeout...")
+        trainer.train(train_loader, val_loader, num_epochs=999999)  # Large number to run until timeout
+    else:
+        # Original logic for specific epoch counts
+        if do_pretrain and trainer.pretrained_model is not None and pretrain_epochs > 0:
+            trainer.train(train_loader, val_loader, num_epochs=pretrain_epochs)
+            trainer.save_checkpoint('pretrained_model.pth')
+            trainer.convert_to_spiking()
+            trainer.save_checkpoint('converted_model.pth')
 
-    # Fine-tune spiking model
-    if finetune_epochs > 0:
-        trainer.train(train_loader, val_loader, num_epochs=finetune_epochs)
-        trainer.save_checkpoint('final_model.pth')
+        # Fine-tune spiking model
+        if finetune_epochs > 0:
+            trainer.train(train_loader, val_loader, num_epochs=finetune_epochs)
+            trainer.save_checkpoint('final_model.pth')
 
 
 if __name__ == '__main__':

@@ -16,13 +16,17 @@ set -euo pipefail
 
 # --- Modules/conda (match your cluster) ---
 module purge
-module load intel/21.2.0 impi/2021.2
+module load anaconda/3/2023.03
+module load cuda/11.6
+module load gcc/11
+module load openmpi_gpu/4.1
 
 # Activate the conda environment
 source /mpcdf/soft/SLE_15/packages/x86_64/anaconda/3/2023.03/etc/profile.d/conda.sh
-# Fix MKL environment variable issue
-export MKL_INTERFACE_LAYER=LP64,GNU
 conda activate cephclr
+
+# Load PyTorch distributed module (must load after anaconda module is loaded)
+module load pytorch-distributed/gpu-cuda-11.6/2.1.0
 
 # --- Python & performance knobs ---
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
@@ -62,7 +66,6 @@ ln -sfn "$RUNDIR" "$REPO_ROOT/checkpoints/spikereg/runs/latest_job"
 
 # --- Safety: checkpoint often (so restart has fresh state) ---
 export SPIKEREG_CHECKPOINT_DIR="${RUNDIR}/checkpoints"
-export SPIKEREG_CHECKPOINT_EVERY_STEPS="${SPIKEREG_CHECKPOINT_EVERY_STEPS:-1000}"   # tune
 export SPIKEREG_KEEP_LAST="${SPIKEREG_KEEP_LAST:-5}"
 
 # --- Aim repo (optional): default to repo-level path alongside checkpoints ---

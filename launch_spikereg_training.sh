@@ -25,41 +25,29 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-latest_ckpt_in() {
-  local dir="$1"
-  local ckpt_dir="$dir/checkpoints"
-  
-  if [[ ! -d "$ckpt_dir" ]]; then
-    # Fallback to old behavior if no checkpoints dir
-    find "$dir" -type f -iname '*ckpt*' -printf "%T@ %p\n" | sort -nr | head -n1 | awk '{print $2}'
-    return
-  fi
-  
-  # Find step-based checkpoints first (highest priority)
-  local step_ckpt
-  step_ckpt=$(find "$ckpt_dir" -name 'model_step_*.pth' -type f | \
-    sed 's/.*model_step_\([0-9]\+\)\.pth/\1 &/' | \
-    sort -nr | head -n1 | awk '{print $2}')
-  
-  if [[ -n "$step_ckpt" ]]; then
-    echo "$step_ckpt"
-    return
-  fi
-  
-  # Fall back to epoch-based checkpoints
-  local epoch_ckpt
-  epoch_ckpt=$(find "$ckpt_dir" -name 'model_epoch_*.pth' -type f | \
-    sed 's/.*model_epoch_\([0-9]\+\)\.pth/\1 &/' | \
-    sort -nr | head -n1 | awk '{print $2}')
-  
-  if [[ -n "$epoch_ckpt" ]]; then
-    echo "$epoch_ckpt"
-    return
-  fi
-  
-  # Final fallback to any checkpoint by timestamp
-  find "$ckpt_dir" -type f \( -name '*.pt' -o -name '*.pth' \) -printf "%T@ %p\n" | sort -nr | head -n1 | awk '{print $2}'
-}
+  latest_ckpt_in() {
+    local dir="$1"
+    local ckpt_dir="$dir/checkpoints"
+    
+    if [[ ! -d "$ckpt_dir" ]]; then
+      echo ""  # No checkpoints directory
+      return
+    fi
+    
+    # Find epoch-based checkpoints ONLY (highest epoch number)
+    local epoch_ckpt
+    epoch_ckpt=$(find "$ckpt_dir" -name 'model_epoch_*.pth' -type f | \
+      sed 's/.*model_epoch_\([0-9]\+\)\.pth/\1 &/' | \
+      sort -nr | head -n1 | awk '{print $2}')
+    
+    if [[ -n "$epoch_ckpt" ]]; then
+      echo "$epoch_ckpt"
+      return
+    fi
+    
+    # No epoch checkpoints found
+    echo ""
+  }
 
 job_state() {
   local jid="$1"
@@ -79,8 +67,10 @@ submit_job() {
   local cfg="${2:-$CONFIG}"
   mkdir -p "$GROUP_DIR/logs"
   if [[ -n "$ckpt" ]]; then
+    echo "[launcher] Submitting job with checkpoint: $ckpt" >&2
     sbatch_out=$(sbatch "$JOB_SCRIPT" --config "$cfg" --start_from_checkpoint "$ckpt" "${EXTRA_ARGS[@]}")
   else
+    echo "[launcher] Submitting job without checkpoint (fresh start)" >&2
     sbatch_out=$(sbatch "$JOB_SCRIPT" --config "$cfg" "${EXTRA_ARGS[@]}")
   fi
   printf "%s\n" "$sbatch_out"
@@ -89,12 +79,38 @@ submit_job() {
 initial_ckpt=""
 if [[ -n "$START_FROM" ]]; then
   initial_ckpt="$START_FROM"
+else
+  # Search for the latest checkpoint across ALL job directories
+  echo "[launcher] Searching for existing checkpoints in $RUN_ROOT..."
+  latest_epoch=-1
+  latest_ckpt=""
+  
+  for job_dir in "$RUN_ROOT"/*/; do
+    if [[ -d "$job_dir/checkpoints" ]]; then
+      ckpt=$(latest_ckpt_in "$job_dir" || true)
+      if [[ -n "$ckpt" ]]; then
+        # Extract epoch number
+        epoch=$(echo "$ckpt" | sed 's/.*model_epoch_\([0-9]\+\)\.pth/\1/')
+        if [[ "$epoch" =~ ^[0-9]+$ ]] && (( epoch > latest_epoch )); then
+          latest_epoch=$epoch
+          latest_ckpt="$ckpt"
+        fi
+      fi
+    fi
+  done
+  
+  if [[ -n "$latest_ckpt" ]]; then
+    echo "[launcher] Found checkpoint from epoch $latest_epoch: $latest_ckpt"
+    initial_ckpt="$latest_ckpt"
+  else
+    echo "[launcher] No existing checkpoints found, starting from scratch"
+  fi
 fi
 
 sbatch_out=$(submit_job "$initial_ckpt" "$CONFIG")
 echo "$sbatch_out"
-job_id=$(echo "$sbatch_out" | awk '{print $4}')
-echo "[launcher] Job ID: $job_id"
+job_id=$(echo "$sbatch_out" | grep -o '[0-9]\+$')
+echo "[launcher] Extracted Job ID: $job_id"
 echo "[launcher] REPO_ROOT=$REPO_ROOT RUN_ROOT=$RUN_ROOT JOB_SCRIPT=$JOB_SCRIPT"
 
 while true; do
@@ -110,13 +126,19 @@ while true; do
   ln -sfn "$JOB_DIR" "$GROUP_DIR/last_jobdir"
   ln -sfn "$JOB_DIR" "${RUN_ROOT}/latest_job"
 
+  # Look for checkpoints in the current job directory (which just finished)
   ckpt_path="$(latest_ckpt_in "$JOB_DIR" || true)"
+  if [[ -n "$ckpt_path" ]]; then
+    echo "[launcher] Found checkpoint: $ckpt_path"
+  else
+    echo "[launcher] No checkpoint found in $JOB_DIR"
+  fi
   case "$state" in
     COMPLETED|TIMEOUT|CANCELLED|FAILED|OUT_OF_MEMORY|PREEMPTED|NODE_FAIL)
       sbatch_out=$(submit_job "${ckpt_path:-}" "$CONFIG")
       echo "$sbatch_out"
-      job_id=$(echo "$sbatch_out" | awk '{print $4}')
-      echo "[launcher] New Job ID: $job_id"
+      job_id=$(echo "$sbatch_out" | grep -o '[0-9]\+$')
+      echo "[launcher] Extracted New Job ID: $job_id"
       ;;
     *)
       echo "[launcher] Stopping loop (state: $state)."
