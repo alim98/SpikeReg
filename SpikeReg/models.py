@@ -30,7 +30,7 @@ class SpikeRegUNet(nn.Module):
         self.in_channels = config.get('in_channels', 2)  # Fixed + Moving
         self.base_channels = config.get('base_channels', 16)
         self.encoder_channels = config.get('encoder_channels', [16, 32, 64, 128])
-        self.decoder_channels = config.get('decoder_channels', [64, 32, 16, 16])
+        self.decoder_channels = config.get('decoder_channels', [128, 64, 32, 16])
         
         # Time windows for each level (decreasing)
         self.encoder_time_windows = config.get('encoder_time_windows', [10, 8, 6, 4])
@@ -42,7 +42,7 @@ class SpikeRegUNet(nn.Module):
         
         # Skip connection merge strategies
         self.skip_merge = config.get('skip_merge', ['concatenate', 'average', 'concatenate', 'none'])
-        # self.skip_merge = ['none', 'average', 'none', 'none']
+        self.skip_merge = ['concatenate', 'concatenate', 'none', 'none'] ##############modeified!!!!#################
         
         # Build encoder
         self.encoder_blocks = nn.ModuleList()
@@ -86,7 +86,7 @@ class SpikeRegUNet(nn.Module):
                 skip_ch = self.encoder_channels[-(i+2)]
             else:
                 skip_ch = self.encoder_channels[0]  # Fallback to first encoder level
-            skip_ch = self.encoder_channels[(-(i+2)+len(self.encoder_channels))%len(self.encoder_channels)]
+            # skip_ch = self.encoder_channels[(-(i+2)+len(self.encoder_channels))%len(self.encoder_channels)]
             
             out_ch = self.decoder_channels[i]
             # out_ch = self.decoder_channels[i+1] if i + 1 < len(self.decoder_channels) else 32

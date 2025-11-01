@@ -76,11 +76,11 @@ class SpikeRegTrainer:
         if is_main_process:
             # Priority: explicit arg > env var AIM_REPO > parent of checkpoint_dir
             self.aim_repo_path = aim_repo or os.getenv("AIM_REPO") or os.path.dirname(self.checkpoint_dir)
-            self.aim_repo = Repo(self.aim_repo_path)
-            self.aim_run = Run(repo=self.aim_repo)
-            self.aim_run["config"] = self.config
-            self.aim_run["checkpoint_dir"] = self.checkpoint_dir
-            self.aim_run["log_dir"] = self.log_dir
+            self.aim_repo = ""#Repo(self.aim_repo_path)
+            self.aim_run = "" #Run(repo=self.aim_repo)
+            # self.aim_run["config"] = self.config
+            # self.aim_run["checkpoint_dir"] = self.checkpoint_dir
+            # self.aim_run["log_dir"] = self.log_dir
             # Set run name to job id if provided/available
             effective_run_name = run_name or os.getenv("SLURM_JOB_ID")
             if effective_run_name:

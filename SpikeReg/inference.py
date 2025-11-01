@@ -22,11 +22,12 @@ def load_model_weights(model, checkpoint_path, device='cpu'):
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     config = checkpoint.get('config', None)
     state_dict = checkpoint.get('model_state_dict', checkpoint)
+    print(config)
     
     # Remove 'module.' prefix if present (from DataParallel)
     if any(k.startswith('module.') for k in state_dict.keys()):
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-    model = PretrainedUNet(config['model']).to(device)
+    model = SpikeRegUNet(config['model']).to(device)
     
     model.load_state_dict(state_dict)
     return model, config
@@ -75,7 +76,7 @@ def get_inference():
 
     # Load config and create model
     config_path = 'checkpoints/oasis/config.yaml'
-    model_path = 'checkpoints/oasis/pretrained_model.pth'
+    model_path = 'checkpoints/oasis/final_model.pth'
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
@@ -139,14 +140,14 @@ def get_inference():
     # warped = infer.apply_deformation(moving_data, displacement_np)
     # return
 
-    sd = torch.load('checkpoints/oasis/pretrained_model.pth', map_location='cpu')
-    state = sd['state_dict'] if 'state_dict' in sd else sd
-    print("state params")
+    # sd = torch.load('checkpoints/oasis/final_model.pth', map_location='cpu')
+    # state = sd['state_dict'] if 'state_dict' in sd else sd
+    # print("state params")
 
-    trainer = SpikeRegTrainer(config, None, None, device=device)
-    trainer.load_checkpoint('pretrained_model.pth')
+    # trainer = SpikeRegTrainer(config, None, None, device=device)
+    # trainer.load_checkpoint('final_model.pth')
 
-    trainer.convert_to_spiking()
+    # trainer.convert_to_spiking()
     
     # for k,v in state['model_state_dict'].items():
     #     try:    
@@ -161,8 +162,8 @@ def get_inference():
 
     # model = trainer.spiking_model
     registration = IterativeRegistration(
-        trainer.spiking_model,
-        num_iterations=1,
+        model,
+        num_iterations=10,
         early_stop_threshold=0.001,
     )
     # return
@@ -170,9 +171,12 @@ def get_inference():
     with torch.no_grad():
         print("Running registration...")
         print(config)
-        output = registration.register(registration.preprocess_volume(img_data), registration.preprocess_volume(moving_data)) if isinstance(model, SpikeRegUNet) else registration(fixed, moving)
+        output = registration(fixed, moving) if isinstance(model, SpikeRegUNet) else registration(fixed, moving)
+        print("Registration output obtained.")
         # output = model(fixed, moving)
-        displacement = torch.from_numpy(output['displacement_field']).to(device) if isinstance(model, SpikeRegUNet) else output
+        print(output)
+        displacement = output['displacement'].to(device) if True else output
+        print("Displacement field obtained.")
         
         # Apply transformation
         warped = spatial_transformer(moving, displacement)
