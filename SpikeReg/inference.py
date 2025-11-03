@@ -16,7 +16,7 @@ import os
 import plotly.graph_objects as go
 import torch
 
-def load_model_weights(model, checkpoint_path, device='cpu'):
+def load_model_weights(model, checkpoint_path, device='cpu', nn_type="Spike"):
     """Load weights from checkpoint into model."""
     print(f"Loading checkpoint from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -27,7 +27,7 @@ def load_model_weights(model, checkpoint_path, device='cpu'):
     # Remove 'module.' prefix if present (from DataParallel)
     if any(k.startswith('module.') for k in state_dict.keys()):
         state_dict = {k.replace('module.', ''): v for k, v in state_dict.items()}
-    model = SpikeRegUNet(config['model']).to(device)
+    model = SpikeRegUNet(config['model']).to(device) if nn_type=="Spike" else PretrainedUNet(config['model']).to(device)
     
     model.load_state_dict(state_dict)
     return model, config
@@ -35,21 +35,6 @@ def load_model_weights(model, checkpoint_path, device='cpu'):
 def get_inference():
     """Run inference using SpikeReg model directly."""
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    
-    # Load images
-    print("Loading images...")
-    # img = nib.load('data/L2R_2021_Task3_val/img0454.nii.gz')
-    # img_data = img.get_fdata()
-    # img_data = img_data.astype(np.float32)
-    # img_tensor = torch.from_numpy(img_data).unsqueeze(0)
-
-    # moving = nib.load('data/L2R_2021_Task3_val/img0455.nii.gz')
-    # moving_data = moving.get_fdata()
-    # moving_data = moving_data.astype(np.float32)
-    # moving_tensor = torch.from_numpy(moving_data).unsqueeze(0)
-    # import nibabel as nib
-    # import numpy as np
-    # import torch
 
     print("Loading images...")
 
@@ -63,16 +48,9 @@ def get_inference():
     moving_data = moving.get_fdata().astype(np.float32)
     moving_tensor = torch.from_numpy(moving_data).unsqueeze(0)  # [1, D, H, W]
 
-    # Stack to create a batch of size 8 (same images repeated)
-    # Resulting shape: [8, 1, D, H, W]
+    # Stack to create a batch of size 1
     img_tensor = img_tensor.repeat(1,1, 1, 1, 1)
     moving_tensor = moving_tensor.repeat(1,1, 1, 1, 1)
-
-    print("img_batch shape:", img_tensor.shape)
-    print("moving_tensor shape:", moving_tensor.shape)
-
-
-    print(f"Image shapes: fixed {img_tensor.shape}, moving {moving_tensor.shape}")
 
     # Load config and create model
     config_path = 'checkpoints/oasis/config.yaml'
@@ -80,18 +58,10 @@ def get_inference():
     with open(config_path, 'r') as f:
         config = yaml.safe_load(f)
 
-    # Initialize model and load weights
-    # model = PretrainedUNet(config['model']).to(device)
-    # model = SpikeRegUNet(config['model']).to(device)
-    model, config_model = load_model_weights(None, model_path, device)
+    model, config_model = load_model_weights(None, model_path, device, nn_type="Normal")
     config = config_model if config_model is not None else config
     model.eval()
-    # model_state_dict=torch.load('checkpoints/oasis/final_model.pth', weights_only=False,map_location=torch.device('cpu'))
-    # print(model_state_dict['model_state_dict'].keys())
-    # return
 
-
-    # Prepare inputs
     fixed = img_tensor.to(device)  # Add batch dimension
     moving = moving_tensor.to(device)
 
@@ -99,74 +69,11 @@ def get_inference():
     spatial_transformer = SpatialTransformer().to(device)
 
     # Create registration wrapper
-    # registration = SpikeRegInference(
-    #     model_path=model_path,
-    #     # config=config,
-    #     device=device,
-    #     patch_size=config['model'].get('patch_size', 32),
-    #     patch_stride=config['model'].get('patch_stride', 16),
-    #     batch_size=1
-    # )
-
     registration = IterativeRegistration(
         model,
         num_iterations=10,
         early_stop_threshold=0.001,
     )
-
-
-
-    # Run inference
-    # # import torch
-    # ckpt = torch.load('checkpoints/oasis/final_model.pth', map_location='cpu')
-    # state = ckpt.get('model_state_dict', ckpt)
-    # for k,v in state.items():
-    #     if hasattr(v, 'shape') and tuple(v.shape) == (128,128,2,2,2):
-    #         print('module expecting 128 in-channels:', k)
-
-
-    # from SpikeReg.registration import SpikeRegInference  # or .registration import SpikeRegInference
-
-    # infer = SpikeRegInference(
-    #     model_path='checkpoints/oasis/final_model.pth',
-    #     config=config,
-    #     device='cpu'  # or 'cuda'
-    # )
-
-    # # inputs can be numpy volumes or tensors; the class will preprocess
-    # print("shape: ", img_data.shape)
-    # displacement_np = infer.register(img_data, moving_data)  # returns displacement numpy array
-    # # If you want the warped image:
-    # warped = infer.apply_deformation(moving_data, displacement_np)
-    # return
-
-    # sd = torch.load('checkpoints/oasis/final_model.pth', map_location='cpu')
-    # state = sd['state_dict'] if 'state_dict' in sd else sd
-    # print("state params")
-
-    # trainer = SpikeRegTrainer(config, None, None, device=device)
-    # trainer.load_checkpoint('final_model.pth')
-
-    # trainer.convert_to_spiking()
-    
-    # for k,v in state['model_state_dict'].items():
-    #     try:    
-    #         print(k, v.shape)
-    #     except:
-    #         # pass
-    #         print(k, v)
-    # # Then compare to your model's named_parameters()
-    # print('\n\nmodel params:')
-    # for k,p in trainer.spiking_model.named_parameters():
-    #     print(k, p.shape)
-
-    # model = trainer.spiking_model
-    registration = IterativeRegistration(
-        model,
-        num_iterations=10,
-        early_stop_threshold=0.001,
-    )
-    # return
 
     with torch.no_grad():
         print("Running registration...")
@@ -174,7 +81,6 @@ def get_inference():
         output = registration(fixed, moving) if isinstance(model, SpikeRegUNet) else registration(fixed, moving)
         print("Registration output obtained.")
         # output = model(fixed, moving)
-        print(output)
         displacement = output['displacement'].to(device) if True else output
         print("Displacement field obtained.")
         
@@ -183,13 +89,10 @@ def get_inference():
     print(warped.shape)
 
     warped_np = warped.cpu().numpy()
-    displacement_np = displacement.cpu().numpy()
-    # print(displacement_np)
-    
+    displacement_np = displacement.cpu().numpy()    
     warped_nii = nib.Nifti1Image(warped_np[0, 0], img.affine, img.header)
     displacement_nii = nib.Nifti1Image(displacement_np[0], img.affine, img.header)
 
-    # Call function to compute and save metrics and visualization
     show_results(device, img, img_data, moving, moving_data, fixed, displacement, warped, warped_nii, displacement_nii)
 
 def show_results(device, img, img_data, moving, moving_data, fixed, displacement, warped, warped_nii, displacement_nii):
@@ -338,7 +241,7 @@ def show_results(device, img, img_data, moving, moving_data, fixed, displacement
         plt.savefig('outputs/registration_visualization.png', dpi=150, bbox_inches='tight')
         plt.close()
         print("\nVisualization saved as 'outputs/registration_visualization.png'")
-###################
+
         # Convert and normalize
         vol = warped.squeeze().cpu().numpy()
         # vol = (vol - vol.min()) / (vol.max() - vol.min())

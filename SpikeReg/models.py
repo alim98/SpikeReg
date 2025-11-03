@@ -74,7 +74,7 @@ class SpikeRegUNet(nn.Module):
         
         # Build decoder
         self.decoder_blocks = nn.ModuleList()
-        print(self.decoder_channels)
+        # print(self.decoder_channels)
         for i in range(len(self.decoder_channels)):
             # Decoder receives features from encoder level -(i+1)
             # in_ch = self.encoder_channels[-(i+1)]
@@ -90,7 +90,7 @@ class SpikeRegUNet(nn.Module):
             
             out_ch = self.decoder_channels[i]
             # out_ch = self.decoder_channels[i+1] if i + 1 < len(self.decoder_channels) else 32
-            print(f"Decoder {i}: in_ch={in_ch}, skip_ch={skip_ch}, out_ch={out_ch}")
+            # print(f"Decoder {i}: in_ch={in_ch}, skip_ch={skip_ch}, out_ch={out_ch}")
             
             block = SpikingDecoderBlock(
                 in_channels=in_ch,
@@ -218,12 +218,12 @@ class SpikeRegUNet(nn.Module):
         spike_counts_number['bottleneck'] = x.sum().cpu().detach().numpy()
         
         # Decoder path
-        print("bottleneck x shape:", x.shape)
-        for i, encf in enumerate(encoder_features):
-            print(f"encoder_features[{i}].shape:", encf.shape)
+        # print("bottleneck x shape:", x.shape)
+        # for i, encf in enumerate(encoder_features):
+        #     print(f"encoder_features[{i}].shape:", encf.shape)
         decoder_features = []
         for i, decoder in enumerate(self.decoder_blocks):
-            print(f"inside decoder{i}")
+            # print(f"inside decoder{i}")
             skip_idx = -(i+2)
             if skip_idx >= -len(encoder_features):
                 skip = encoder_features[skip_idx]
