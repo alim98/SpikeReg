@@ -4,7 +4,11 @@ SpikeReg: Energy-Efficient Deformable Medical Image Registration using Spiking N
 
 from .models import SpikeRegUNet
 from .registration import SpikeRegInference
-from .training import SpikeRegTrainer
+# Make training imports optional (they require 'aim' which may not be installed)
+try:
+    from .training import SpikeRegTrainer
+except ImportError:
+    SpikeRegTrainer = None
 from .neurons import LIFNeuron
 
 __version__ = "0.1.0"

@@ -13,3 +13,4 @@ pairs_val.csv
 pairs_val.csv.1
 final_logs/*
 slurm/*
+inference_results_20251108_120509/*
