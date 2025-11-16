@@ -292,8 +292,9 @@ class SpikingRegularizer(nn.Module):
         total_spikes = 0
         spike_imbalance = 0
         
-        print("\n[SpikingRegularizer] Debug Info:")
-        print("Spike counts input:", spike_counts)
+        # Debug removed - was causing massive log spam
+        # print("\n[SpikingRegularizer] Debug Info:")
+        # print("Spike counts input:", spike_counts)
         
         for layer_name, spike_rate in spike_counts.items():
             total_spikes += spike_rate
@@ -301,15 +302,15 @@ class SpikingRegularizer(nn.Module):
             # Penalize deviation from target rate
             spike_imbalance += (spike_rate - self.target_rate) ** 2
         
-        print("  Total spikes:", total_spikes)
-        print("  Spike imbalance:", spike_imbalance)
+        # print("  Total spikes:", total_spikes)
+        # print("  Spike imbalance:", spike_imbalance)
         # L1 penalty on total spikes
         spike_loss = self.spike_weight * total_spikes
-        print("  Spike loss (L1):", spike_loss)
+        # print("  Spike loss (L1):", spike_loss)
 
         # L2 penalty on rate imbalance
         balance_loss = self.balance_weight * spike_imbalance
-        print("  Balance loss (L2):", balance_loss)
+        # print("  Balance loss (L2):", balance_loss)
         
         return spike_loss + balance_loss
 

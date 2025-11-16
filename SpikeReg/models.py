@@ -73,16 +73,14 @@ class SpikeRegUNet(nn.Module):
         
         # Build decoder
         self.decoder_blocks = nn.ModuleList()
+        prev_out_ch = self.encoder_channels[-1]
         for i in range(len(self.decoder_channels)):
-            # Decoder receives features from encoder level -(i+1)
-            in_ch = self.encoder_channels[-(i+1)]
+            in_ch = prev_out_ch
             
-            # Determine expected skip channels based on forward logic:
-            #   skip_idx = -(i+2) if within range else encoder_features[0]
             if i + 2 <= len(self.encoder_channels):
                 skip_ch = self.encoder_channels[-(i+2)]
             else:
-                skip_ch = self.encoder_channels[0]  # Fallback to first encoder level
+                skip_ch = self.encoder_channels[0]
             
             out_ch = self.decoder_channels[i]
             
@@ -95,9 +93,11 @@ class SpikeRegUNet(nn.Module):
                 tau_u=self.decoder_tau_u[i],
                 time_window=self.decoder_time_windows[i],
                 skip_merge=self.skip_merge[i],
-                attention=(i < 2)  # Attention in first two decoder levels
+                attention=(i < 2)
             )
             self.decoder_blocks.append(block)
+            
+            prev_out_ch = out_ch
         
         # Output projection
         self.output_projection = OutputProjection(
@@ -163,10 +163,10 @@ class SpikeRegUNet(nn.Module):
         # Concatenate fixed and moving images
         x = torch.cat([fixed, moving], dim=1)  # [B, 2, D, H, W]
         
-        # log min max of x
-        x_min = x.min().item()
-        x_max = x.max().item()
-        print(f"[SpikeRegUNet DEBUG] Input range: min={x_min}, max={x_max}")
+        # Debug removed - was causing log spam
+        # x_min = x.min().item()
+        # x_max = x.max().item()
+        # print(f"[SpikeRegUNet DEBUG] Input range: min={x_min}, max={x_max}")
 
         # Encode to spikes
         spike_input = self.encode_to_spikes(x, self.spike_encoding_window.item())
@@ -334,26 +334,7 @@ class PretrainedUNet(nn.Module):
         # Debug printing: run only on the first forward call to help diagnose
         # channel mismatches between encoder outputs and decoder expectations.
         # ------------------------------------------------------------------
-        if not hasattr(self, "_debug_printed"):
-            self._debug_printed = True
-            print("[PretrainedUNet DEBUG] Encoder feature shapes:")
-            for i, feat in enumerate(skip_features):
-                print(f"  Level {i}: {tuple(feat.shape)}")
-            print("[PretrainedUNet DEBUG] Decoder expected in_channels list:")
-            expected = []
-            N = len(self.encoder_channels)
-            prev_ch = self.encoder_channels[-1]
-            for i, out_ch in enumerate(self.decoder_channels):
-                if 0 < i < N:
-                    skip_ch = self.encoder_channels[-(i+1)]
-                    in_ch = prev_ch + skip_ch
-                else:
-                    in_ch = prev_ch
-                expected.append(in_ch)
-                prev_ch = out_ch
-            for i, ch in enumerate(expected):
-                print(f"  Decoder {i} expects {ch} channels")
-            print("------------------------------------------------------------")
+        # Debug code removed - was causing massive log spam with DataParallel
         
         # Decoder
         for i, decoder in enumerate(self.decoders):

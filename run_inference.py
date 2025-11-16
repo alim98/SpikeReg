@@ -13,7 +13,7 @@ import nibabel as nib
 from pathlib import Path
 import time
 from datetime import datetime
-
+import argparse
 # Add project root to path
 sys.path.insert(0, str(Path(__file__).parent))
 
@@ -34,13 +34,20 @@ def load_model(checkpoint_path, config_path=None, device='cuda'):
     print(f"Loading checkpoint from: {checkpoint_path}")
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
-    # Load config
-    if config_path and Path(config_path).exists():
+    # Load config - prioritize checkpoint's embedded config
+    if 'config' in checkpoint:
+        config = checkpoint['config']
+        # Check if config has nested 'model' key or is the model config directly
+        if isinstance(config, dict) and 'model' in config:
+            model_config = config['model']
+        else:
+            model_config = config
+        print("Using config from checkpoint")
+    elif config_path and Path(config_path).exists():
         with open(config_path, 'r') as f:
             config = yaml.safe_load(f)
             model_config = config.get('model', {})
-    elif 'config' in checkpoint:
-        model_config = checkpoint['config']
+        print(f"Using config from {config_path}")
     else:
         print("Warning: No config found, using default configuration")
         model_config = {
@@ -273,55 +280,48 @@ def run_patch_inference(model, fixed, moving, config, device='cuda'):
 
 
 def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--checkpoint_path", type=str, required=False, help="Single checkpoint path (if not provided, will test all)")
+    parser.add_argument("--config_path", type=str, required=False, help="Config path (auto-detected if not provided)")
+    parser.add_argument("--data_dir", type=str, default="/u/almik/SpikeReg2/data")
+    parser.add_argument("--output_dir", type=str, default="/u/almik/SpikeReg5/SpikeReg/inference_results")
+    args = parser.parse_args()
+
     print("="*70)
-    print("SpikeReg Inference Script")
+    print("SpikeReg Inference Script - Testing All Checkpoints")
     print("="*70)
     
     # Configuration
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     print(f"\nUsing device: {device}")
     
-    # Paths
+    # Get project root
     project_root = Path(__file__).parent
     
-    # Try multiple checkpoint locations
-    checkpoint_paths = [
-        project_root / "checkpoints/final_oasis/best_model.pth",
-        project_root / "checkpoints/final_oasis/converted_model.pth",
-        project_root / "checkpoints/spikereg/runs/22434639/checkpoints/converted_model.pth",
-        project_root / "checkpoints/spikereg/runs/22434639/checkpoints/final_model.pth",
-    ]
+    # Find all checkpoint paths
+    if args.checkpoint_path:
+        # Single checkpoint mode
+        checkpoint_paths = [Path(args.checkpoint_path)]
+    else:
+        # Test these specific checkpoints
+        checkpoint_paths = [
+            project_root / "checkpoints/final_oasis/best_model.pth",
+            project_root / "checkpoints/final_oasis/converted_model.pth",
+            project_root / "checkpoints/spikereg/runs/22171951/checkpoints/model_epoch_99.pth",  # Latest from current training
+            # project_root / "checkpoints/spikereg/runs/22434639/checkpoints/converted_model.pth",  # Architecture incompatibility during forward pass
+            # project_root / "checkpoints/spikereg/runs/22434639/checkpoints/final_model.pth",  # Corrupted file
+        ]
+        
+        # Filter to only existing checkpoints
+        checkpoint_paths = [ckpt for ckpt in checkpoint_paths if ckpt.exists()]
     
-    checkpoint_path = None
-    for path in checkpoint_paths:
-        if path.exists():
-            checkpoint_path = path
-            break
+    print(f"\nFound {len(checkpoint_paths)} checkpoints to test")
     
-    if checkpoint_path is None:
-        print("Error: No checkpoint found!")
-        print("Looked in:")
-        for path in checkpoint_paths:
-            print(f"  - {path}")
-        return
+    data_dir = Path(args.data_dir)
+    base_output_dir = Path(args.output_dir)
+    base_output_dir.mkdir(exist_ok=True, parents=True)
     
-    config_path = project_root / "checkpoints/final_oasis/config.yaml"
-    data_dir = Path("/u/almik/SpikeReg2/data")
-    output_dir = project_root / f"inference_results_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-    output_dir.mkdir(exist_ok=True)
-    
-    print(f"\nCheckpoint: {checkpoint_path}")
-    print(f"Config: {config_path}")
-    print(f"Data directory: {data_dir}")
-    print(f"Output directory: {output_dir}")
-    
-    # Load model
-    print("\n" + "="*70)
-    print("Loading Model")
-    print("="*70)
-    model, model_config = load_model(checkpoint_path, config_path, device)
-    
-    # Load test volumes
+    # Load test volumes once (reuse for all checkpoints)
     print("\n" + "="*70)
     print("Loading Test Volumes")
     print("="*70)
@@ -364,124 +364,214 @@ def main():
     fixed_tensor = normalize_volume(fixed_tensor)
     moving_tensor = normalize_volume(moving_tensor)
     
-    # Extract center patch for testing
-    patch_size = model_config.get('patch_size', 32)
-    D, H, W = fixed_tensor.shape[2:]
+    # Summary results
+    all_results = []
     
-    # Extract center patch
-    d_start = (D - patch_size) // 2
-    h_start = (H - patch_size) // 2
-    w_start = (W - patch_size) // 2
+    # Test each checkpoint
+    for idx, checkpoint_path in enumerate(checkpoint_paths):
+        print("\n" + "="*70)
+        print(f"Testing Checkpoint {idx+1}/{len(checkpoint_paths)}")
+        print("="*70)
+        print(f"Checkpoint: {checkpoint_path}")
+        
+        # Create output directory for this checkpoint
+        # Use a descriptive name based on the checkpoint path
+        if "final_oasis" in str(checkpoint_path):
+            ckpt_name = f"final_oasis_{checkpoint_path.stem}"
+        else:
+            # Extract run ID and epoch/step info
+            parts = checkpoint_path.parts
+            run_idx = parts.index("runs") + 1 if "runs" in parts else -1
+            if run_idx > 0 and run_idx < len(parts):
+                run_id = parts[run_idx]
+                ckpt_name = f"run_{run_id}_{checkpoint_path.stem}"
+            else:
+                ckpt_name = checkpoint_path.stem
+        
+        output_dir = base_output_dir / ckpt_name
+        output_dir.mkdir(exist_ok=True, parents=True)
+        
+        # Find corresponding config
+        if args.config_path:
+            config_path = Path(args.config_path)
+        else:
+            # Try to find config in the same directory as checkpoint
+            config_candidates = [
+                checkpoint_path.parent.parent / "training_config.yaml",
+                checkpoint_path.parent.parent / "config.yaml",
+                checkpoint_path.parent / "config.yaml",
+                project_root / "checkpoints/final_oasis/config.yaml",
+            ]
+            config_path = None
+            for candidate in config_candidates:
+                if candidate.exists():
+                    config_path = candidate
+                    break
+        
+        print(f"Config: {config_path}")
+        print(f"Output directory: {output_dir}")
+        
+        try:
+            # Load model
+            print("\nLoading Model...")
+            model, model_config = load_model(checkpoint_path, config_path, device)
+            
+            # Extract center patch for testing
+            patch_size = model_config.get('patch_size', 32)
+            D, H, W = fixed_tensor.shape[2:]
+            
+            # Extract center patch
+            d_start = (D - patch_size) // 2
+            h_start = (H - patch_size) // 2
+            w_start = (W - patch_size) // 2
+            
+            fixed_patch = fixed_tensor[:, :, 
+                                        d_start:d_start+patch_size,
+                                        h_start:h_start+patch_size,
+                                        w_start:w_start+patch_size].to(device)
+            moving_patch = moving_tensor[:, :,
+                                          d_start:d_start+patch_size,
+                                          h_start:h_start+patch_size,
+                                          w_start:w_start+patch_size].to(device)
+            
+            print(f"Patch size: {patch_size}")
+            print(f"Fixed patch shape: {fixed_patch.shape}")
+            print(f"Moving patch shape: {moving_patch.shape}")
+            
+            # Run inference
+            print("\nRunning Registration...")
+            start_time = time.time()
+            output = run_patch_inference(model, fixed_patch, moving_patch, model_config, device)
+            inference_time = time.time() - start_time
+            
+            print(f"Registration completed in {inference_time:.2f} seconds")
+            print(f"Iterations: {output['iterations']}")
+            print(f"Converged: {output['converged']}")
+            
+            # Extract results
+            displacement = output['displacement']
+            warped = output['warped']
+            
+            # Compute metrics
+            print("Computing Metrics...")
+            metrics = compute_registration_metrics(
+                fixed_patch,
+                moving_patch,
+                warped,
+                displacement
+            )
+            
+            print("\nRegistration Metrics:")
+            print(f"  NCC: {metrics['ncc']:.4f}")
+            print(f"  MSE: {metrics['mse']:.4f}")
+            print(f"  SSIM: {metrics['ssim']:.4f}")
+            print(f"  Jacobian (mean): {metrics['jacobian_mean']:.4f}")
+            print(f"  Jacobian (std): {metrics['jacobian_std']:.4f}")
+            print(f"  Negative Jacobian: {metrics['jacobian_negative_fraction']*100:.2f}%")
+            
+            # Add iteration info to metrics
+            metrics['iterations'] = output['iterations']
+            metrics['converged'] = output['converged']
+            metrics['time'] = inference_time
+            metrics['checkpoint'] = str(checkpoint_path)
+            
+            # Check for spike count history
+            if 'spike_count_history' in output and output['spike_count_history']:
+                print("\nSpike Activity:")
+                final_spikes = output['spike_count_history'][-1]
+                for layer, count in final_spikes.items():
+                    print(f"  {layer}: {count:.4f}")
+            
+            # Visualize results
+            print("Generating Visualizations...")
+            visualize_registration_results(
+                fixed_patch,
+                moving_patch,
+                warped,
+                displacement,
+                metrics,
+                output_dir
+            )
+            
+            # Save numerical results
+            print("Saving Results...")
+            
+            # Save displacement field
+            np.save(output_dir / 'displacement_field.npy', displacement.cpu().numpy())
+            
+            # Save warped volume
+            np.save(output_dir / 'warped_patch.npy', warped.cpu().numpy())
+            
+            # Save metrics
+            import json
+            with open(output_dir / 'metrics.json', 'w') as f:
+                # Convert numpy types to native Python types for JSON serialization
+                metrics_json = {k: float(v) if isinstance(v, (np.floating, torch.Tensor)) else (str(v) if isinstance(v, Path) else v)
+                               for k, v in metrics.items()}
+                json.dump(metrics_json, f, indent=2)
+            
+            print(f"✓ Results saved to: {output_dir}")
+            
+            # Store summary for this checkpoint
+            all_results.append({
+                'checkpoint': str(checkpoint_path),
+                'checkpoint_name': ckpt_name,
+                'ncc': float(metrics['ncc']),
+                'mse': float(metrics['mse']),
+                'ssim': float(metrics['ssim']),
+                'jacobian_negative_fraction': float(metrics['jacobian_negative_fraction']),
+                'time': inference_time,
+                'converged': output['converged'],
+                'iterations': output['iterations']
+            })
+            
+            # Clean up GPU memory
+            del model, output, displacement, warped, fixed_patch, moving_patch
+            torch.cuda.empty_cache()
+            
+        except Exception as e:
+            print(f"✗ Error testing checkpoint: {e}")
+            import traceback
+            traceback.print_exc()
+            all_results.append({
+                'checkpoint': str(checkpoint_path),
+                'checkpoint_name': ckpt_name,
+                'error': str(e)
+            })
+            continue
     
-    fixed_patch = fixed_tensor[:, :, 
-                                d_start:d_start+patch_size,
-                                h_start:h_start+patch_size,
-                                w_start:w_start+patch_size].to(device)
-    moving_patch = moving_tensor[:, :,
-                                  d_start:d_start+patch_size,
-                                  h_start:h_start+patch_size,
-                                  w_start:w_start+patch_size].to(device)
-    
-    print(f"\nPatch size: {patch_size}")
-    print(f"Fixed patch shape: {fixed_patch.shape}")
-    print(f"Moving patch shape: {moving_patch.shape}")
-    
-    # Run inference
+    # Save summary of all results
     print("\n" + "="*70)
-    print("Running Registration")
+    print("All Checkpoints Tested - Generating Summary")
     print("="*70)
     
-    start_time = time.time()
-    output = run_patch_inference(model, fixed_patch, moving_patch, model_config, device)
-    inference_time = time.time() - start_time
-    
-    print(f"\nRegistration completed in {inference_time:.2f} seconds")
-    print(f"Iterations: {output['iterations']}")
-    print(f"Converged: {output['converged']}")
-    
-    # Extract results
-    displacement = output['displacement']
-    warped = output['warped']
-    
-    # Compute metrics
-    print("\n" + "="*70)
-    print("Computing Metrics")
-    print("="*70)
-    
-    metrics = compute_registration_metrics(
-        fixed_patch,
-        moving_patch,
-        warped,
-        displacement
-    )
-    
-    print("\nRegistration Metrics:")
-    print(f"  NCC: {metrics['ncc']:.4f}")
-    print(f"  MSE: {metrics['mse']:.4f}")
-    print(f"  SSIM: {metrics['ssim']:.4f}")
-    print(f"  Jacobian (mean): {metrics['jacobian_mean']:.4f}")
-    print(f"  Jacobian (std): {metrics['jacobian_std']:.4f}")
-    print(f"  Negative Jacobian: {metrics['jacobian_negative_fraction']*100:.2f}%")
-    
-    # Add iteration info to metrics
-    metrics['iterations'] = output['iterations']
-    metrics['converged'] = output['converged']
-    metrics['time'] = inference_time
-    
-    # Check for spike count history
-    if 'spike_count_history' in output and output['spike_count_history']:
-        print("\nSpike Activity:")
-        final_spikes = output['spike_count_history'][-1]
-        for layer, count in final_spikes.items():
-            print(f"  {layer}: {count:.4f}")
-    
-    # Visualize results
-    print("\n" + "="*70)
-    print("Generating Visualizations")
-    print("="*70)
-    
-    visualize_registration_results(
-        fixed_patch,
-        moving_patch,
-        warped,
-        displacement,
-        metrics,
-        output_dir
-    )
-    
-    # Save numerical results
-    print("\n" + "="*70)
-    print("Saving Results")
-    print("="*70)
-    
-    # Save displacement field
-    np.save(output_dir / 'displacement_field.npy', displacement.cpu().numpy())
-    print(f"Saved displacement field to: {output_dir / 'displacement_field.npy'}")
-    
-    # Save warped volume
-    np.save(output_dir / 'warped_patch.npy', warped.cpu().numpy())
-    print(f"Saved warped patch to: {output_dir / 'warped_patch.npy'}")
-    
-    # Save metrics
     import json
-    with open(output_dir / 'metrics.json', 'w') as f:
-        # Convert numpy types to native Python types for JSON serialization
-        metrics_json = {k: float(v) if isinstance(v, (np.floating, torch.Tensor)) else v 
-                       for k, v in metrics.items()}
-        json.dump(metrics_json, f, indent=2)
-    print(f"Saved metrics to: {output_dir / 'metrics.json'}")
+    summary_path = base_output_dir / 'summary_all_checkpoints.json'
+    with open(summary_path, 'w') as f:
+        json.dump(all_results, f, indent=2)
+    print(f"\nSummary saved to: {summary_path}")
+    
+    # Print summary table
+    print("\n" + "="*70)
+    print("SUMMARY OF ALL CHECKPOINTS")
+    print("="*70)
+    print(f"{'Checkpoint':<50} {'NCC':>8} {'MSE':>10} {'SSIM':>8} {'Time(s)':>8} {'Conv':>6}")
+    print("-" * 100)
+    
+    for result in all_results:
+        if 'error' in result:
+            print(f"{result['checkpoint_name']:<50} {'ERROR':<40}")
+        else:
+            print(f"{result['checkpoint_name']:<50} {result['ncc']:>8.4f} {result['mse']:>10.6f} {result['ssim']:>8.4f} {result['time']:>8.2f} {str(result['converged']):>6}")
     
     print("\n" + "="*70)
     print("Inference Complete!")
     print("="*70)
-    print(f"\nAll results saved to: {output_dir}")
-    print("\nFiles generated:")
-    print(f"  - registration_results.png  (visualization)")
-    print(f"  - displacement_field.npy     (deformation field)")
-    print(f"  - warped_patch.npy          (registered image)")
-    print(f"  - metrics.json              (quantitative metrics)")
+    print(f"\nAll results saved to: {base_output_dir}")
+    print(f"Summary: {summary_path}")
 
 
 if __name__ == '__main__':
+    
     main()
 

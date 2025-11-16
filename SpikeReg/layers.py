@@ -242,6 +242,7 @@ class SpikingDecoderBlock(nn.Module):
         self.time_window = time_window
         self.skip_merge = skip_merge
         self.attention = attention
+        self.skip_adapter = None
         
         # Upsampling path: operates only on decoder feature channels
         self.upconv = SpikingTransposeConv3d(
@@ -259,6 +260,12 @@ class SpikingDecoderBlock(nn.Module):
             refine_in_channels = out_channels + skip_channels
         else:
             refine_in_channels = out_channels
+
+        if skip_merge == "average" and skip_channels != out_channels:
+            self.skip_adapter = nn.Sequential(
+                nn.Conv3d(skip_channels, out_channels, kernel_size=1, bias=False),
+                nn.BatchNorm3d(out_channels)
+            )
 
         self.refine = SpikingConv3d(
             refine_in_channels, out_channels, kernel_size=3,
@@ -329,7 +336,8 @@ class SpikingDecoderBlock(nn.Module):
             if self.skip_merge == "concatenate":
                 merged = torch.cat([up, skip], dim=1)
             elif self.skip_merge == "average":
-                merged = (up + skip) / 2
+                skip_aligned = self.skip_adapter(skip) if self.skip_adapter is not None else skip
+                merged = (up + skip_aligned) / 2
             elif self.skip_merge == "attention" and self.attention:
                 gated = self.attention_gate(up, skip)
                 merged = torch.cat([up, gated], dim=1)
@@ -339,15 +347,15 @@ class SpikingDecoderBlock(nn.Module):
             if merged.shape[1] != self.refine.conv.in_channels:
                 # Adjust refine layer *once* to correct channel count, avoid repeated re-instantiation
                 if not hasattr(self, "_refine_adjusted"):
-                    print(f"[Refine DEBUG] Adjusting refine layer to {merged.shape[1]} input channels (was {self.refine.conv.in_channels}).")
+                    # print(f"[Refine DEBUG] Adjusting refine layer to {merged.shape[1]} input channels (was {self.refine.conv.in_channels}).")
                     tau_u_current = self.refine.neurons.tau_u if hasattr(self.refine, 'neurons') else 0.9
                     self.refine = SpikingConv3d(
                         merged.shape[1], self.refine.conv.out_channels, kernel_size=3,
                         stride=1, padding=1, tau_u=tau_u_current
                     )
                     self._refine_adjusted = True
-                else:
-                    print("[Refine DEBUG] Skipping repeated refine adjustment; please verify architecture.")
+                # else:
+                    # print("[Refine DEBUG] Skipping repeated refine adjustment; please verify architecture.")
             spikes = self.refine(merged)
             spike_outputs.append(spikes)
         

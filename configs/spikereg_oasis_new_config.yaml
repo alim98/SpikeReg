@@ -33,9 +33,9 @@ training:
   # Phases - run until timeout, no epoch limits
   pretrain: true
   # Iteration targets from paper (use steps if your trainer supports it)
-  pretrain_epochs: 100             # 0 = run until timeout
+  pretrain_epochs: 100           # Full training
   # pretrain_steps: 80000          # paper: ANN warm-start ~80k iters
-  finetune_epochs: 100            # 0 = run until timeout
+  finetune_epochs: 50           # Full fine-tuning
   # finetune_steps: 20000          # paper: SNN fine-tune ~20k iters
 
   # Iterative registration policy
@@ -84,11 +84,14 @@ training:
     target_spike_rate: 0.1
 
   # Core training settings (paper: batch size 2; clip 1.0)
-  batch_size: 16
+  # Balanced batch size to avoid OOM while maintaining good GPU utilization
+  batch_size: 4
   gradient_clip: 1.0
-  accum_steps: 1
-  num_workers: 8
-  amp: true
+  accum_steps: 2
+  num_workers: 12  # Increased for better data loading throughput
+  amp: true  # Mixed precision for faster training
+  pin_memory: true  # Faster data transfer to GPU
+  prefetch_factor: 4  # Prefetch more batches
 
   # Logging & checkpoints (epoch-based for proper continuation)
   checkpoint_interval: 1      # every epoch
@@ -144,7 +147,7 @@ data:
 multi_gpu:
   use_multi_gpu: true
   gpu_ids: [0, 1, 2, 3]         # Use all 4 A100 GPUs
-  distributed: false             # Use DataParallel (simpler than DDP)
+  distributed: true
 
 # -------- Neuromorphic deployment --------
 neuromorphic:

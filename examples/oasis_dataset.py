@@ -301,6 +301,8 @@ def create_task3_loaders(
     patch_stride: int = 32,
     patches_per_pair: int = 20,
     num_workers: int = 4,
+    pin_memory: bool = True,
+    prefetch_factor: int = 2,
 ) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader, Optional[torch.utils.data.DataLoader]]:
 
     pairs_csv = Path(val_dir) / "pairs_val.csv"
@@ -327,20 +329,26 @@ def create_task3_loaders(
         pairs_csv=str(pairs_csv) if pairs_csv else None,
     )
     
+    # DataLoader kwargs for optimized data loading
+    loader_kwargs = {
+        'batch_size': batch_size,
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+    }
+    # Only add prefetch_factor if num_workers > 0 (required by PyTorch)
+    if num_workers > 0 and prefetch_factor is not None:
+        loader_kwargs['prefetch_factor'] = prefetch_factor
+    
     train_loader = torch.utils.data.DataLoader(
         train_ds,
-        batch_size=batch_size,
         shuffle=True,
-        num_workers=num_workers,
-        pin_memory=True,
+        **loader_kwargs
     )
     
     val_loader = torch.utils.data.DataLoader(
         val_ds,
-        batch_size=batch_size,
         shuffle=False,
-        num_workers=num_workers,
-        pin_memory=True,
+        **loader_kwargs
     )
 
     test_loader = None
@@ -356,10 +364,8 @@ def create_task3_loaders(
         )
         test_loader = torch.utils.data.DataLoader(
             test_ds,
-            batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
-            pin_memory=True,
+            **loader_kwargs
         )
 
     return train_loader, val_loader, test_loader
@@ -382,6 +388,8 @@ def create_oasis_loaders(
     patch_stride: int = 32,
     patches_per_pair: int = 20,
     num_workers: int = 4,
+    pin_memory: bool = True,
+    prefetch_factor: int = 2,
 ):
 
     root = Path(data_root)
@@ -402,6 +410,8 @@ def create_oasis_loaders(
         patch_stride=patch_stride,
         patches_per_pair=patches_per_pair,
         num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=prefetch_factor,
     )
     
     return train_loader, val_loader

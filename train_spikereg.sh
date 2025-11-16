@@ -2,6 +2,7 @@
 # --- Slurm header ---
 #SBATCH -D ./
 #SBATCH -o ./slurm/output_spikereg/%j.out
+#SBATCH -e ./slurm/error_spikereg/%j.err
 #SBATCH -J spikereg_training
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=4           # # of processes (DDP)
