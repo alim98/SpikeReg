@@ -33,9 +33,9 @@ training:
   # Phases - run until timeout, no epoch limits
   pretrain: true
   # Iteration targets from paper (use steps if your trainer supports it)
-  pretrain_epochs: 100           # Full training
+  pretrain_epochs: 10          # Full training
   # pretrain_steps: 80000          # paper: ANN warm-start ~80k iters
-  finetune_epochs: 50           # Full fine-tuning
+  finetune_epochs: 10           # Full fine-tuning
   # finetune_steps: 20000          # paper: SNN fine-tune ~20k iters
 
   # Iterative registration policy

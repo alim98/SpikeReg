@@ -16,3 +16,5 @@ slurm/*
 inference_results_20251108_120509/*
 old/*
 redundant/*
+slurmold/*
+checkpointsold/*

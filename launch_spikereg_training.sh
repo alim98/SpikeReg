@@ -35,9 +35,11 @@ done
     fi
     
     # Find epoch-based checkpoints ONLY (highest epoch number)
+    # Support both old naming (model_epoch_X.pth) and new naming (pretrain_epoch_X.pth, finetune_epoch_X.pth)
     local epoch_ckpt
-    epoch_ckpt=$(find "$ckpt_dir" -name 'model_epoch_*.pth' -type f | \
-      sed 's/.*model_epoch_\([0-9]\+\)\.pth/\1 &/' | \
+    epoch_ckpt=$(find "$ckpt_dir" -type f \( -name 'model_epoch_*.pth' -o -name 'pretrain_epoch_*.pth' -o -name 'finetune_epoch_*.pth' \) | \
+      sed -E 's/.*_(epoch_[0-9]+)\.pth/\1 &/' | \
+      sed 's/epoch_//' | \
       sort -nr | head -n1 | awk '{print $2}')
     
     if [[ -n "$epoch_ckpt" ]]; then
@@ -118,7 +120,8 @@ else
       
       ckpt=$(latest_ckpt_in "$abs_job_dir" || true)
       if [[ -n "$ckpt" ]]; then
-        epoch=$(echo "$ckpt" | sed 's/.*model_epoch_\([0-9]\+\)\.pth/\1/')
+        # Extract epoch number from checkpoint filename (supports model_epoch_X.pth, pretrain_epoch_X.pth, finetune_epoch_X.pth)
+        epoch=$(echo "$ckpt" | sed -E 's/.*epoch_([0-9]+)\.pth/\1/')
         if [[ "$epoch" =~ ^[0-9]+$ ]]; then
           if (( epoch >= pretrain_epochs )); then
             if (( epoch > latest_finetune_epoch )); then
@@ -271,7 +274,8 @@ while true; do
           
           ckpt=$(latest_ckpt_in "$abs_job_dir" || true)
           if [[ -n "$ckpt" ]]; then
-            epoch=$(echo "$ckpt" | sed 's/.*model_epoch_\([0-9]\+\)\.pth/\1/')
+            # Extract epoch number from checkpoint filename (supports model_epoch_X.pth, pretrain_epoch_X.pth, finetune_epoch_X.pth)
+            epoch=$(echo "$ckpt" | sed -E 's/.*epoch_([0-9]+)\.pth/\1/')
             if [[ "$epoch" =~ ^[0-9]+$ ]]; then
               if (( epoch >= pretrain_epochs )); then
                 if (( epoch > latest_finetune_epoch )); then
