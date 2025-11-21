@@ -138,6 +138,8 @@ data:
   # Validation split
   val_split: 0.2
 
+  debug_percent: 10.0
+
   # L2R Task 3 (OASIS) paths (update to your layout)
   train_dir: "/u/almik/SpikeReg2/data/L2R_2021_Task3_train"
   val_dir:   "/u/almik/SpikeReg2/data/L2R_2021_Task3_val"

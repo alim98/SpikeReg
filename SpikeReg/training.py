@@ -5,7 +5,7 @@ Training utilities for SpikeReg
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from aim import Repo, Run
 import numpy as np
 from tqdm import tqdm
@@ -75,32 +75,17 @@ class SpikeRegTrainer:
         self.is_main_process = is_main_process
 
         self.aim_run = None
+        self.aim_run_hash = None
+        self.aim_repo_path = None
+        self.aim_repo = None
+        
         if is_main_process:
-            # Priority: explicit arg > env var AIM_REPO > parent of checkpoint_dir
             self.aim_repo_path = aim_repo or os.getenv("AIM_REPO") or os.path.dirname(self.checkpoint_dir)
             self.aim_repo = Repo(self.aim_repo_path)
-            self.aim_run = Run(repo=self.aim_repo)
-            self.aim_run["config"] = self.config
-            self.aim_run["checkpoint_dir"] = self.checkpoint_dir
-            self.aim_run["log_dir"] = self.log_dir
-            # Set run name to job id if provided/available
-            effective_run_name = run_name or os.getenv("SLURM_JOB_ID")
-            if effective_run_name:
-                try:
-                    # Aim SDK may support setting a user-defined name
-                    self.aim_run.name = str(effective_run_name)
-                except Exception:
-                    # Fallback to a tracked field
-                    self.aim_run["run_name"] = str(effective_run_name)
-            # Always store job id field if present
-            if os.getenv("SLURM_JOB_ID"):
-                self.aim_run["job_id"] = os.getenv("SLURM_JOB_ID")
+            self._init_aim_run(run_name=run_name)
         else:
             with open(self.log_file, 'a') as f:
                 f.write("Aim logging disabled on non-main process (rank/LOCAL_RANK != 0)\n")
-        
-        # Store run hash for continuation
-        self.aim_run_hash = None
         
         # Initialize models
         self.pretrained_model = None
@@ -210,6 +195,53 @@ class SpikeRegTrainer:
             f.write(f"Model wrapped for multi-GPU training on devices: {self.gpu_ids}\n")
         return model
     
+    def _init_aim_run(self, run_name: Optional[str] = None, run_hash: Optional[str] = None):
+        if not self.is_main_process or self.aim_repo is None:
+            return
+        
+        if run_hash:
+            try:
+                self.aim_run = Run(run_hash=run_hash, repo=self.aim_repo, read_only=False)
+                self.aim_run_hash = run_hash
+                print(f"Reopened existing Aim run: {run_hash}")
+                self._update_aim_tags()
+                return
+            except Exception as e:
+                print(f"Warning: Could not reopen Aim run {run_hash}: {e}")
+                print("Creating new Aim run instead...")
+        
+        self.aim_run = Run(repo=self.aim_repo)
+        self.aim_run_hash = self.aim_run.hash
+        self.aim_run["config"] = self.config
+        self.aim_run["checkpoint_dir"] = self.checkpoint_dir
+        self.aim_run["log_dir"] = self.log_dir
+        
+        effective_run_name = run_name or os.getenv("SLURM_JOB_ID")
+        if effective_run_name:
+            try:
+                self.aim_run.name = str(effective_run_name)
+            except Exception:
+                self.aim_run["run_name"] = str(effective_run_name)
+        
+        if os.getenv("SLURM_JOB_ID"):
+            self.aim_run["job_id"] = os.getenv("SLURM_JOB_ID")
+        
+        self._update_aim_tags()
+    
+    def _update_aim_tags(self):
+        if self.aim_run is None or not self.is_main_process:
+            return
+        
+        try:
+            self.aim_run.add_tag('spikereg')
+            
+            if self.training_phase == 'pretrain':
+                self.aim_run.add_tag('pretrain')
+            elif self.training_phase == 'finetune':
+                self.aim_run.add_tag('finetune')
+        except Exception as e:
+            print(f"Warning: Could not add Aim tag: {e}")
+    
     def _init_models(self):
         """Initialize models based on training phase"""
         if self.config['training']['pretrain']:
@@ -256,6 +288,7 @@ class SpikeRegTrainer:
             )
             
             self.training_phase = 'finetune'
+            self._update_aim_tags()
             self._init_optimizer()
             self._init_loss()
             
@@ -596,6 +629,7 @@ class SpikeRegTrainer:
         
         # Switch to finetune phase
         self.training_phase = 'finetune'
+        self._update_aim_tags()
         
         # Get the underlying model if wrapped with DataParallel
         base_model = self.pretrained_model
@@ -649,7 +683,7 @@ class SpikeRegTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
             'config': self.config,
-            'aim_run_hash': self.aim_run.hash if hasattr(self.aim_run, 'hash') else None,
+            'aim_run_hash': self.aim_run_hash,
         }
         
         if self.scheduler is not None:
@@ -787,7 +821,8 @@ class SpikeRegTrainer:
 
         # 3) load weights ONCE (lenient)
         missing, unexpected = self.current_model.load_state_dict(state, strict=False)
-        if missing or unexpected:
+        has_arch_mismatch = bool(missing) or bool(unexpected)
+        if has_arch_mismatch:
             print("[load_checkpoint] missing:", missing)
             print("[load_checkpoint] unexpected:", unexpected)
 
@@ -796,11 +831,13 @@ class SpikeRegTrainer:
         self.best_val_loss = float(checkpoint.get('best_val_loss', float('inf')))
         self.training_phase = checkpoint.get('training_phase', 'pretrain')  # Default to pretrain if not saved
 
-        if 'optimizer_state_dict' in checkpoint:
+        if 'optimizer_state_dict' in checkpoint and not has_arch_mismatch:
             try:
                 self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
             except Exception as e:
                 print("[load_checkpoint] optimizer state load skipped:", e)
+        elif has_arch_mismatch and 'optimizer_state_dict' in checkpoint:
+            print("[load_checkpoint] optimizer state load skipped due to architecture mismatch")
 
         if self.scheduler is not None and 'scheduler_state_dict' in checkpoint:
             try:
@@ -812,12 +849,11 @@ class SpikeRegTrainer:
         with open(self.log_file, 'a') as f:
             f.write(f"Loaded checkpoint from epoch {self.epoch}\n")
         
-        # Store parent run hash as a field for traceability (avoid unsupported reopen-by-hash)
-        if self.aim_run is not None and 'aim_run_hash' in checkpoint and checkpoint['aim_run_hash']:
-            try:
-                self.aim_run["parent_run_hash"] = str(checkpoint['aim_run_hash'])
-            except Exception:
-                pass
+        if self.is_main_process and 'aim_run_hash' in checkpoint and checkpoint['aim_run_hash']:
+            saved_run_hash = checkpoint['aim_run_hash']
+            if self.aim_run_hash != saved_run_hash:
+                print(f"Reopening Aim run from checkpoint: {saved_run_hash}")
+                self._init_aim_run(run_hash=saved_run_hash)
 
     
     def _log_epoch_metrics(self, train_metrics: Dict[str, float], val_metrics: Dict[str, float]):
@@ -862,7 +898,6 @@ def save_config(config: Dict, path: str):
 
 
 def _create_loaders_from_config(config: Dict) -> Tuple[DataLoader, DataLoader]:
-    """Create OASIS dataloaders based on config paths and settings."""
     from examples.oasis_dataset import create_oasis_loaders
 
     data_cfg = config.get('data', {})
@@ -873,19 +908,14 @@ def _create_loaders_from_config(config: Dict) -> Tuple[DataLoader, DataLoader]:
     patch_stride = int(data_cfg.get('patch_stride', 16))
     num_workers = int(config.get('training', {}).get('num_workers', 4))
 
-    # The dataset factory expects data_root to be the parent of L2R_2021_Task3_train
-    # If train_dir is /u/almik/SpikeReg2/data/L2R_2021_Task3_train, then data_root should be /u/almik/SpikeReg2/data
     if train_dir.endswith('/L2R_2021_Task3_train'):
         data_root = train_dir[:-len('/L2R_2021_Task3_train')]
     else:
-        # Fallback: assume train_dir is the data root
         data_root = train_dir
 
-    # Get additional training config for data loading optimization
     train_cfg = config.get('training', {})
     pin_memory = train_cfg.get('pin_memory', True)
-    prefetch_factor = train_cfg.get('prefetch_factor', 2)
-    
+
     train_loader, val_loader = create_oasis_loaders(
         data_root,
         batch_size=batch_size,
@@ -894,8 +924,33 @@ def _create_loaders_from_config(config: Dict) -> Tuple[DataLoader, DataLoader]:
         patches_per_pair=int(config.get('data', {}).get('patches_per_pair', 20)),
         num_workers=num_workers,
         pin_memory=pin_memory,
-        prefetch_factor=prefetch_factor if num_workers > 0 else None,
     )
+
+    debug_percent = data_cfg.get('debug_percent')
+    if debug_percent is not None:
+        debug_percent = float(debug_percent)
+        if debug_percent > 0:
+            debug_percent = min(debug_percent, 100.0)
+            n_train = max(1, int(len(train_loader.dataset) * debug_percent / 100.0))
+            n_val = max(1, int(len(val_loader.dataset) * debug_percent / 100.0))
+
+            loader_kwargs = {
+                "batch_size": batch_size,
+                "num_workers": num_workers,
+                "pin_memory": pin_memory,
+            }
+
+            train_loader = DataLoader(
+                Subset(train_loader.dataset, list(range(n_train))),
+                shuffle=True,
+                **loader_kwargs,
+            )
+
+            val_loader = DataLoader(
+                Subset(val_loader.dataset, list(range(n_val))),
+                shuffle=False,
+                **loader_kwargs,
+            )
 
     return train_loader, val_loader
 
@@ -911,6 +966,15 @@ def main_cli():
     parser.add_argument('--start_from_checkpoint', help='Path to checkpoint to resume from')
     parser.add_argument('--aim_repo', type=str, default=None, help='Path to Aim repository (overrides AIM_REPO env)')
     args = parser.parse_args()
+
+    if args.start_from_checkpoint:
+        base = os.path.basename(args.start_from_checkpoint)
+        if base.startswith('finetune_') or base.startswith('converted_') or base == 'final_model.pth':
+            d = os.path.dirname(args.start_from_checkpoint)
+            p = os.path.join(d, 'pretrained_model.pth')
+            if os.path.exists(p):
+                print(f"[main_cli] Redirecting from {base} to pretrained_model.pth for pretrain→convert→finetune flow")
+                args.start_from_checkpoint = p
 
     cfg = load_config(args.config)
 
@@ -934,6 +998,9 @@ def main_cli():
     if args.start_from_checkpoint:
         print(f"Resuming from checkpoint: {args.start_from_checkpoint}")
         trainer.load_checkpoint(args.start_from_checkpoint)
+        if trainer.training_phase == 'pretrain':
+            trainer.save_checkpoint('pretrained_model.pth')
+            trainer.epoch = -1
         print(f"Resumed from epoch {trainer.epoch}")
 
     # Training phases per config
@@ -969,6 +1036,7 @@ def main_cli():
                 if not converted_complete:
                     print("Converting pretrained model to spiking...")
                     trainer.convert_to_spiking()
+                    trainer.epoch = -1
                     trainer.save_checkpoint('converted_model.pth')
                 else:
                     print(f"Conversion already complete! Found {converted_model_path}")
@@ -997,6 +1065,7 @@ def main_cli():
                     if architecture_mismatch:
                         print("Converted checkpoint has old architecture. Re-converting from pretrained model...")
                         trainer.convert_to_spiking()
+                        trainer.epoch = -1
                         trainer.save_checkpoint('converted_model.pth')
                     else:
                         trainer.load_checkpoint('converted_model.pth')
@@ -1005,6 +1074,7 @@ def main_cli():
                 trainer.train(train_loader, val_loader, num_epochs=pretrain_epochs)
                 trainer.save_checkpoint('pretrained_model.pth')
                 trainer.convert_to_spiking()
+                trainer.epoch = -1
                 trainer.save_checkpoint('converted_model.pth')
 
         # Fine-tune spiking model
@@ -1040,6 +1110,7 @@ def main_cli():
                         if pretrain_complete:
                             trainer.load_checkpoint('pretrained_model.pth')
                             trainer.convert_to_spiking()
+                            trainer.epoch = -1
                             trainer.save_checkpoint('converted_model.pth')
                         else:
                             print("Warning: Cannot re-convert - pretrained model not found. Loading checkpoint with mismatched layers...")
@@ -1050,14 +1121,19 @@ def main_cli():
                     print(f"Loading pretrained model and converting: {pretrained_model_path}")
                     trainer.load_checkpoint('pretrained_model.pth')
                     trainer.convert_to_spiking()
+                    trainer.epoch = -1
                     trainer.save_checkpoint('converted_model.pth')
                 else:
                     print("Warning: No pretrained/converted model found for finetune. Skipping finetune.")
                     return
             
-            # Reset epoch counter for finetune phase to start from 0
-            # This ensures finetune trains epochs 0 to (finetune_epochs-1)
-            trainer.epoch = -1
+            # Reset epoch counter for finetune phase
+            # If we just converted (training_phase='finetune' but epoch is high from pretrain), reset it
+            # If training_phase is not 'finetune', also reset it
+            if trainer.training_phase == 'finetune' and trainer.epoch >= pretrain_epochs:
+                trainer.epoch = -1
+            elif trainer.training_phase != 'finetune':
+                trainer.epoch = -1
             trainer.train(train_loader, val_loader, num_epochs=finetune_epochs)
             trainer.save_checkpoint('final_model.pth')
 
