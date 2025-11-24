@@ -56,41 +56,36 @@ def normalized_cross_correlation(
     ncc = ncc.view(B, -1).mean(dim=1)
     
     return ncc
-
-
 def dice_score(
     pred: torch.Tensor,
     target: torch.Tensor,
     num_classes: Optional[int] = None,
     smooth: float = 1e-5
 ) -> torch.Tensor:
-    """
-    Compute Dice score for segmentation
-    
-    Args:
-        pred: Predicted segmentation [B, C, D, H, W] or [B, D, H, W]
-        target: Target segmentation [B, C, D, H, W] or [B, D, H, W]
-        num_classes: Number of classes (auto-detect if None)
-        smooth: Smoothing factor
-        
-    Returns:
-        dice: Dice scores [B] or [B, C]
-    """
-    if pred.dim() == 4:  # [B, D, H, W]
-        # Convert to one-hot if needed
+    if pred.dim() == 5 and pred.size(1) == 1:
+        pred = pred[:, 0]
+    if target.dim() == 5 and target.size(1) == 1:
+        target = target[:, 0]
+
+    if pred.dim() == 4:
         if num_classes is None:
-            num_classes = int(max(pred.max(), target.max()) + 1)
-        
+            num_classes = int(torch.max(pred.max(), target.max()).item()) + 1
         pred = F.one_hot(pred.long(), num_classes).permute(0, 4, 1, 2, 3).float()
         target = F.one_hot(target.long(), num_classes).permute(0, 4, 1, 2, 3).float()
-    
-    # Compute intersection and union
+    elif pred.dim() == 5:
+        if pred.size(1) != target.size(1):
+            raise ValueError(f"pred and target channel mismatch: {pred.size(1)} vs {target.size(1)}")
+        pred = pred.float()
+        target = target.float()
+    else:
+        raise ValueError(f"Unsupported pred dim: {pred.dim()}")
+
     intersection = (pred * target).sum(dim=(2, 3, 4))
-    union = pred.sum(dim=(2, 3, 4)) + target.sum(dim=(2, 3, 4))
-    
-    # Dice formula
-    dice = (2 * intersection + smooth) / (union + smooth)
-    
+    pred_sum = pred.sum(dim=(2, 3, 4))
+    target_sum = target.sum(dim=(2, 3, 4))
+
+    dice = (2.0 * intersection + smooth) / (pred_sum + target_sum + smooth)
+    dice = torch.clamp(dice, 0.0, 1.0)
     return dice
 
 
@@ -155,66 +150,49 @@ def jacobian_determinant_stats(displacement: torch.Tensor) -> Dict[str, float]:
     
     return stats
 
-
 def target_registration_error(
     landmarks_fixed: torch.Tensor,
     landmarks_moving: torch.Tensor,
     displacement: torch.Tensor,
     spacing: Optional[Tuple[float, float, float]] = None
 ) -> torch.Tensor:
-    """
-    Compute target registration error for landmarks
-    
-    Args:
-        landmarks_fixed: Fixed landmarks [N, 3]
-        landmarks_moving: Moving landmarks [N, 3]
-        displacement: Displacement field [1, 3, D, H, W]
-        spacing: Voxel spacing for physical units
-        
-    Returns:
-        tre: Target registration errors [N]
-    """
     device = displacement.device
-    
-    # Ensure landmarks are on same device
-    landmarks_fixed = landmarks_fixed.to(device)
-    landmarks_moving = landmarks_moving.to(device)
-    
-    # Get displacement field dimensions
+    landmarks_fixed = landmarks_fixed.to(device).float()
+    landmarks_moving = landmarks_moving.to(device).float()
+
+    if displacement.dim() != 5 or displacement.size(1) != 3:
+        raise ValueError(f"displacement must be [B,3,D,H,W], got {displacement.shape}")
+    if displacement.size(0) != 1:
+        displacement = displacement[:1]
+
     _, _, D, H, W = displacement.shape
-    
-    # Normalize landmark coordinates to [-1, 1]
-    landmarks_norm = landmarks_moving.clone()
-    landmarks_norm[:, 0] = (landmarks_norm[:, 0] / (W - 1)) * 2 - 1
-    landmarks_norm[:, 1] = (landmarks_norm[:, 1] / (H - 1)) * 2 - 1
-    landmarks_norm[:, 2] = (landmarks_norm[:, 2] / (D - 1)) * 2 - 1
-    
-    # Reshape for grid_sample (needs [N, 1, 1, 1, 3])
-    landmarks_grid = landmarks_norm.view(-1, 1, 1, 1, 3)
-    
-    # Sample displacement at landmark locations
+
+    lm = landmarks_moving.clone()
+    lm[:, 0] = (lm[:, 0] / (W - 1)) * 2 - 1
+    lm[:, 1] = (lm[:, 1] / (H - 1)) * 2 - 1
+    lm[:, 2] = (lm[:, 2] / (D - 1)) * 2 - 1
+
+    landmarks_grid = lm.view(-1, 1, 1, 1, 3)
+
     disp_at_landmarks = F.grid_sample(
-        displacement.repeat(landmarks_grid.shape[0], 1, 1, 1, 1),
+        displacement.expand(landmarks_grid.size(0), -1, -1, -1, -1),
         landmarks_grid,
         mode='bilinear',
         padding_mode='border',
         align_corners=True
     )
-    
-    # Extract displacement values
-    disp_values = disp_at_landmarks.squeeze()  # [N, 3]
-    
-    # Warp moving landmarks
-    warped_landmarks = landmarks_moving + disp_values.transpose(0, 1)
-    
-    # Compute error
-    error = torch.norm(warped_landmarks - landmarks_fixed, dim=1)
-    
-    # Convert to physical units if spacing provided
+
+    disp_values = disp_at_landmarks.squeeze(-1).squeeze(-1).squeeze(-1)
+
+    warped_landmarks = landmarks_moving + disp_values
+
+    delta = warped_landmarks - landmarks_fixed
+
     if spacing is not None:
-        spacing_tensor = torch.tensor(spacing, device=device)
-        error = error * spacing_tensor.norm()
-    
+        spacing_tensor = torch.tensor(spacing, device=device).view(1, 3)
+        delta = delta * spacing_tensor
+
+    error = torch.linalg.norm(delta, dim=1)
     return error
 
 

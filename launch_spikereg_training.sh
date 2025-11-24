@@ -24,8 +24,7 @@ while [[ $# -gt 0 ]]; do
     *) EXTRA_ARGS+=("$1"); shift 1;;
   esac
 done
-
-  latest_ckpt_in() {
+latest_ckpt_in() {
     local dir="$1"
     local ckpt_dir="$dir/checkpoints"
     
@@ -34,19 +33,23 @@ done
       return
     fi
     
-    # Priority order: final_model.pth > finetune_epoch_* > converted_model.pth > pretrained_model.pth > pretrain_epoch_*
+    # Priority order per user specification:
+    # 1. pretrain_epoch_n.pth (latest pretrain epoch)
+    # 2. pretrain_best_model.pth
+    # 3. converted_model.pth
+    # 4. finetune_epoch_n.pth (latest finetune epoch)
     
-    # 1. Check for final model (training complete)
-    if [[ -f "$ckpt_dir/final_model.pth" ]]; then
-      echo "$ckpt_dir/final_model.pth"
+    # 1. Check for pretrain checkpoints (latest epoch)
+    local pretrain_ckpt
+    pretrain_ckpt=$(find "$ckpt_dir" -name 'pretrain_epoch_*.pth' 2>/dev/null | sort -V | tail -n1)
+    if [[ -n "$pretrain_ckpt" ]]; then
+      echo "$pretrain_ckpt"
       return
     fi
     
-    # 2. Check for finetune checkpoints (use latest by modification time)
-    local finetune_ckpt
-    finetune_ckpt=$(find "$ckpt_dir" -type f -name 'finetune_epoch_*.pth' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-)
-    if [[ -n "$finetune_ckpt" ]]; then
-      echo "$finetune_ckpt"
+    # 2. Check for pretrain_best_model.pth
+    if [[ -f "$ckpt_dir/pretrain_best_model.pth" ]]; then
+      echo "$ckpt_dir/pretrain_best_model.pth"
       return
     fi
     
@@ -56,23 +59,16 @@ done
       return
     fi
     
-    # 4. Check for pretrained model
-    if [[ -f "$ckpt_dir/pretrained_model.pth" ]]; then
-      echo "$ckpt_dir/pretrained_model.pth"
-      return
-    fi
-    
-    # 5. Check for pretrain checkpoints (use latest by modification time)
-    local pretrain_ckpt
-    pretrain_ckpt=$(find "$ckpt_dir" -type f -name 'pretrain_epoch_*.pth' -printf '%T@ %p\n' 2>/dev/null | sort -rn | head -n1 | cut -d' ' -f2-)
-    if [[ -n "$pretrain_ckpt" ]]; then
-      echo "$pretrain_ckpt"
+    # 4. Check for finetune checkpoints (latest epoch)
+    local finetune_ckpt
+    finetune_ckpt=$(find "$ckpt_dir" -name 'finetune_epoch_*.pth' 2>/dev/null | sort -V | tail -n1)
+    if [[ -n "$finetune_ckpt" ]]; then
+      echo "$finetune_ckpt"
       return
     fi
     
     echo ""
   }
-
 job_state() {
   local jid="$1"
   local s
@@ -100,30 +96,59 @@ submit_job() {
   printf "%s\n" "$sbatch_out"
 }
 
+find_latest_checkpoint_recursive() {
+  local search_root="$1"
+  local best_ckpt=""
+  local best_priority=999
+  local best_epoch=-1
+  
+  # Search recursively for all checkpoints
+  while IFS= read -r ckpt_path; do
+    if [[ -z "$ckpt_path" ]]; then
+      continue
+    fi
+    
+    local priority=999
+    local epoch=-1
+    
+    # Determine priority and epoch (lower priority number = higher priority)
+    if [[ "$ckpt_path" == *"pretrain_epoch_"* ]]; then
+      priority=1
+      epoch=$(echo "$ckpt_path" | sed -E 's/.*pretrain_epoch_([0-9]+)\.pth/\1/')
+    elif [[ "$ckpt_path" == *"pretrain_best_model.pth" ]]; then
+      priority=2
+    elif [[ "$ckpt_path" == *"converted_model.pth" ]]; then
+      priority=3
+    elif [[ "$ckpt_path" == *"finetune_epoch_"* ]]; then
+      priority=4
+      epoch=$(echo "$ckpt_path" | sed -E 's/.*finetune_epoch_([0-9]+)\.pth/\1/')
+    else
+      continue
+    fi
+    
+    # Check if this checkpoint is better than current best
+    if (( priority < best_priority )) || \
+       (( priority == best_priority && epoch > best_epoch )); then
+      best_ckpt="$ckpt_path"
+      best_priority=$priority
+      best_epoch=$epoch
+    fi
+  done < <(find "$search_root" -type f \( -name "finetune_epoch_*.pth" -o -name "converted_model.pth" -o -name "pretrain_best_model.pth" -o -name "pretrain_epoch_*.pth" \) 2>/dev/null)
+  
+  echo "$best_ckpt"
+}
+
 initial_ckpt=""
 if [[ -n "$START_FROM" ]]; then
   initial_ckpt="$START_FROM"
 else
-  echo "[launcher] Searching for existing checkpoints in $RUN_ROOT..."
+  echo "[launcher] Searching for existing checkpoints in $RUN_ROOT and subfolders..."
   
-  # Search for latest checkpoint in most recent job
-  for job_dir in $(find "$RUN_ROOT" -maxdepth 1 -type d ! -path "$RUN_ROOT" -exec basename {} \; | grep -E '^[0-9]+$' | sort -rn); do
-    full_path="$RUN_ROOT/$job_dir"
-    if [[ -L "$full_path" ]]; then
-      continue
-    fi
-    if [[ -d "$full_path/checkpoints" ]]; then
-      abs_job_dir=$(cd "$full_path" && pwd)
-      ckpt=$(latest_ckpt_in "$abs_job_dir" || true)
-      if [[ -n "$ckpt" ]]; then
-        initial_ckpt="$ckpt"
-        echo "[launcher] Found checkpoint: $initial_ckpt"
-        break
-      fi
-    fi
-  done
+  initial_ckpt=$(find_latest_checkpoint_recursive "$RUN_ROOT")
   
-  if [[ -z "$initial_ckpt" ]]; then
+  if [[ -n "$initial_ckpt" ]]; then
+    echo "[launcher] Found checkpoint: $initial_ckpt"
+  else
     echo "[launcher] No existing checkpoints found, starting from scratch"
   fi
 fi
@@ -198,87 +223,18 @@ while true; do
     COMPLETED|TIMEOUT|CANCELLED|FAILED|OUT_OF_MEMORY|PREEMPTED|NODE_FAIL)
       echo "[launcher] Job ended with state: $state. Restarting..."
       
-      # Re-search for the best checkpoint to resume from (same logic as initial search)
-      pretrain_epochs=$(grep -E '^\s*pretrain_epochs:' "$CONFIG" | sed 's/.*:\s*\([0-9]\+\).*/\1/' || echo "0")
+      # Re-search for the best checkpoint to resume from (recursive search)
+      restart_ckpt=$(find_latest_checkpoint_recursive "$RUN_ROOT")
       
-      restart_ckpt=""
-      pretrained_model=""
-      final_model=""
-      latest_finetune_epoch=-1
-      latest_finetune_ckpt=""
-      latest_pretrain_epoch=-1
-      latest_pretrain_ckpt=""
-      
-      # Sort directories by job ID (numeric) descending to prioritize latest runs
-      # Extract numeric job IDs, sort them descending, then process in that order
-      # Since we process in descending order, the first match is the latest
-      for job_dir in $(find "$RUN_ROOT" -maxdepth 1 -type d ! -path "$RUN_ROOT" -exec basename {} \; | grep -E '^[0-9]+$' | sort -rn); do
-        full_path="$RUN_ROOT/$job_dir"
-        # Skip symlinks (like latest_job, latest_group) - only process actual directories
-        if [[ -L "$full_path" ]]; then
-          continue
-        fi
-        if [[ -d "$full_path/checkpoints" ]]; then
-          # Resolve to absolute path to avoid symlink issues
-          abs_job_dir=$(cd "$full_path" && pwd)
-          if [[ -f "$abs_job_dir/checkpoints/final_model.pth" ]]; then
-            # Only set if not already set (first match is latest due to descending sort)
-            if [[ -z "$final_model" ]]; then
-              final_model="$abs_job_dir/checkpoints/final_model.pth"
-            fi
-          fi
-          if [[ -f "$abs_job_dir/checkpoints/pretrained_model.pth" ]]; then
-            # Only set if not already set (first match is latest due to descending sort)
-            if [[ -z "$pretrained_model" ]]; then
-              pretrained_model="$abs_job_dir/checkpoints/pretrained_model.pth"
-            fi
-          fi
-          
-          ckpt=$(latest_ckpt_in "$abs_job_dir" || true)
-          if [[ -n "$ckpt" ]]; then
-            # Extract epoch number from checkpoint filename (supports model_epoch_X.pth, pretrain_epoch_X.pth, finetune_epoch_X.pth)
-            epoch=$(echo "$ckpt" | sed -E 's/.*epoch_([0-9]+)\.pth/\1/')
-            if [[ "$epoch" =~ ^[0-9]+$ ]]; then
-              # Check if it's a finetune checkpoint by filename prefix
-              if [[ "$ckpt" == *"finetune_epoch"* ]]; then
-                if (( epoch > latest_finetune_epoch )); then
-                  latest_finetune_epoch=$epoch
-                  latest_finetune_ckpt="$ckpt"
-                fi
-              else
-                # It's a pretrain checkpoint
-                if (( epoch > latest_pretrain_epoch )); then
-                  latest_pretrain_epoch=$epoch
-                  latest_pretrain_ckpt="$ckpt"
-                fi
-              fi
-            fi
-          fi
-        fi
-      done
-      
-      if [[ -n "$final_model" ]]; then
-        echo "[launcher] Training complete! Found final_model.pth: $final_model"
-        restart_ckpt=$(cd "$(dirname "$final_model")" && pwd)/final_model.pth
-      elif [[ -n "$latest_finetune_ckpt" ]]; then
-        echo "[launcher] Resuming finetune from epoch $latest_finetune_epoch: $latest_finetune_ckpt"
-        restart_ckpt=$(cd "$(dirname "$latest_finetune_ckpt")" && pwd)/$(basename "$latest_finetune_ckpt")
-      elif [[ -n "$pretrained_model" ]]; then
-        echo "[launcher] Pretrain complete! Using pretrained_model.pth for finetune: $pretrained_model"
-        # Use absolute path to avoid symlink issues
-        pretrained_dir=$(cd "$(dirname "$pretrained_model")" && pwd)
-        converted_model_path="$pretrained_dir/converted_model.pth"
-        if [[ -f "$converted_model_path" ]]; then
-          restart_ckpt=$(cd "$(dirname "$converted_model_path")" && pwd)/converted_model.pth
-        else
-          restart_ckpt=$(cd "$(dirname "$pretrained_model")" && pwd)/pretrained_model.pth
-        fi
-      elif [[ -n "$latest_pretrain_ckpt" ]]; then
-        echo "[launcher] Resuming pretrain from epoch $latest_pretrain_epoch: $latest_pretrain_ckpt"
-        restart_ckpt=$(cd "$(dirname "$latest_pretrain_ckpt")" && pwd)/$(basename "$latest_pretrain_ckpt")
+      if [[ -n "$restart_ckpt" ]]; then
+        echo "[launcher] Found checkpoint to resume from: $restart_ckpt"
+        restart_ckpt=$(cd "$(dirname "$restart_ckpt")" && pwd)/$(basename "$restart_ckpt")
       elif [[ -n "$ckpt_path" ]]; then
         echo "[launcher] Using checkpoint from current job: $ckpt_path"
         restart_ckpt=$(cd "$(dirname "$ckpt_path")" && pwd)/$(basename "$ckpt_path")
+      else
+        echo "[launcher] No checkpoint found, starting from scratch"
+        restart_ckpt=""
       fi
       
       sbatch_out=$(submit_job "$restart_ckpt" "$CONFIG")

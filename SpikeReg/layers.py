@@ -79,9 +79,19 @@ class SpikingConv3d(nn.Module):
         
         return spikes
     
-    def reset_neurons(self):
-        """Reset neuron states"""
-        self.neurons.reset_state(1, 1, 1, 1, 1)  # Will be resized on first forward
+    def reset_neurons(self, batch_size=1, *spatial_dims):
+        """Reset neuron states
+        
+        Note: If spatial_dims are not provided, uses placeholder shape (1,1,1,1,1).
+        The neuron will resize on first forward call if membrane is None.
+        For shape-aware reset, pass actual dimensions: reset_neurons(batch_size, C, D, H, W)
+        """
+        if spatial_dims:
+            device = next(self.conv.parameters()).device if list(self.conv.parameters()) else torch.device('cpu')
+            self.neurons.reset_state(batch_size, *spatial_dims, device=device)
+        else:
+            device = next(self.conv.parameters()).device if list(self.conv.parameters()) else torch.device('cpu')
+            self.neurons.reset_state(1, 1, 1, 1, 1, device=device)
 
 
 class SpikingTransposeConv3d(nn.Module):
@@ -125,21 +135,24 @@ class SpikingTransposeConv3d(nn.Module):
         spikes = self.neurons(x)
         return spikes
     
-    def reset_neurons(self):
-        """Reset neuron states"""
-        self.neurons.reset_state(1, 1, 1, 1, 1)
-
+    def reset_neurons(self, batch_size=1, *spatial_dims):
+        """Reset neuron states
+        
+        Note: If spatial_dims are not provided, uses placeholder shape (1,1,1,1,1).
+        The neuron will resize on first forward call if membrane is None.
+        For shape-aware reset, pass actual dimensions: reset_neurons(batch_size, C, D, H, W)
+        """
+        if spatial_dims:
+            device = next(self.conv.parameters()).device if list(self.conv.parameters()) else torch.device('cpu')
+            self.neurons.reset_state(batch_size, *spatial_dims, device=device)
+        else:
+            device = next(self.conv.parameters()).device if list(self.conv.parameters()) else torch.device('cpu')
+            self.neurons.reset_state(1, 1, 1, 1, 1, device=device)
 
 class SpikingEncoderBlock(nn.Module):
     """
     Encoder block for Spiking U-Net
-    
-    Contains:
-    - Spiking Conv3d with stride for downsampling
-    - Optional residual connection
-    - Lateral inhibition for sparsity
     """
-    
     def __init__(
         self,
         in_channels: int,
@@ -152,19 +165,17 @@ class SpikingEncoderBlock(nn.Module):
         residual: bool = False
     ):
         super().__init__()
-        
+
         self.time_window = time_window
         self.residual = residual
-        
-        # Main path
+
         self.conv = SpikingConv3d(
             in_channels, out_channels, kernel_size,
-            stride=stride, padding=kernel_size//2,
+            stride=stride, padding=kernel_size // 2,
             tau_u=tau_u, lateral_inhibition=lateral_inhibition
         )
-        
-        # Residual path (if enabled)
-        if residual and stride == 1:
+
+        if residual and stride == 1 and in_channels == out_channels:
             self.shortcut = nn.Identity()
         elif residual:
             self.shortcut = SpikingConv3d(
@@ -173,58 +184,60 @@ class SpikingEncoderBlock(nn.Module):
             )
         else:
             self.shortcut = None
-    
-    def forward(self, x: torch.Tensor, time_steps: Optional[int] = None) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Forward pass through encoder block
-        
-        Args:
-            x: Input spike tensor or continuous tensor
-            time_steps: Number of time steps to process
-            
-        Returns:
-            spikes: Accumulated spikes over time window
-            skip: Skip connection output (spike rates)
-        """
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        time_steps: Optional[int] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+
         if time_steps is None:
             time_steps = self.time_window
-        
-        # Reset neurons
-        self.conv.reset_neurons()
-        if self.shortcut is not None:
-            self.shortcut.reset_neurons()
-        
-        # Process over time
+
+        B, C, D, H, W = x.shape
+
+        conv = self.conv.conv
+        kD, kH, kW = conv.kernel_size
+        sD, sH, sW = conv.stride
+        pD, pH, pW = conv.padding
+        dD, dH, dW = conv.dilation
+
+        out_D = (D + 2 * pD - dD * (kD - 1) - 1) // sD + 1
+        out_H = (H + 2 * pH - dH * (kH - 1) - 1) // sH + 1
+        out_W = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
+        out_C = conv.out_channels
+
+        self.conv.reset_neurons(B, out_C, out_D, out_H, out_W)
+
+        if hasattr(self.shortcut, "reset_neurons"):
+            sc_conv = self.shortcut.conv
+            kD2, kH2, kW2 = sc_conv.kernel_size
+            sD2, sH2, sW2 = sc_conv.stride
+            pD2, pH2, pW2 = sc_conv.padding
+            dD2, dH2, dW2 = sc_conv.dilation
+
+            out_D2 = (D + 2 * pD2 - dD2 * (kD2 - 1) - 1) // sD2 + 1
+            out_H2 = (H + 2 * pH2 - dH2 * (kH2 - 1) - 1) // sH2 + 1
+            out_W2 = (W + 2 * pW2 - dW2 * (kW2 - 1) - 1) // sW2 + 1
+            out_C2 = sc_conv.out_channels
+
+            self.shortcut.reset_neurons(B, out_C2, out_D2, out_H2, out_W2)
+
         spike_outputs = []
         for t in range(time_steps):
-            # Main path
             spikes = self.conv(x)
-            
-            # Residual connection
             if self.shortcut is not None:
                 spikes = spikes + self.shortcut(x)
-            
             spike_outputs.append(spikes)
-        
-        # Stack spikes over time
-        spike_tensor = torch.stack(spike_outputs, dim=1)  # [B, T, C, D, H, W]
-        
-        # Compute spike rates for skip connection
-        spike_rates = spike_tensor.mean(dim=1)  # [B, C, D, H, W]
-        
+
+        spike_tensor = torch.stack(spike_outputs, dim=1)
+        spike_rates = spike_tensor.mean(dim=1)
+
         return spike_tensor, spike_rates
-
-
 class SpikingDecoderBlock(nn.Module):
     """
     Decoder block for Spiking U-Net
-    
-    Contains:
-    - Spiking TransposeConv3d for upsampling
-    - Skip connection merging
-    - Optional attention mechanism
     """
-    
     def __init__(
         self,
         in_channels: int,
@@ -234,28 +247,25 @@ class SpikingDecoderBlock(nn.Module):
         stride: int = 2,
         tau_u: float = 0.9,
         time_window: int = 10,
-        skip_merge: str = "concatenate",  # "concatenate", "average", "attention"
+        skip_merge: str = "concatenate",
         attention: bool = False
     ):
         super().__init__()
-        
+
         self.time_window = time_window
         self.skip_merge = skip_merge
         self.attention = attention
         self.skip_adapter = None
-        
-        # Upsampling path: operates only on decoder feature channels
+        self._timestep_warned = False
+
         self.upconv = SpikingTransposeConv3d(
             in_channels, out_channels, kernel_size,
             stride=stride, tau_u=tau_u
         )
 
-        # Skip connection processing / attention gate
         if skip_merge == "attention" and attention:
-            # Gating signal comes from upsampled decoder features (out_channels)
             self.attention_gate = AttentionGate(out_channels, skip_channels, out_channels)
 
-        # Feature refinement after merging skip connection
         if skip_merge in ["concatenate", "attention"]:
             refine_in_channels = out_channels + skip_channels
         else:
@@ -271,68 +281,62 @@ class SpikingDecoderBlock(nn.Module):
             refine_in_channels, out_channels, kernel_size=3,
             stride=1, padding=1, tau_u=tau_u
         )
-    
+
     def forward(
         self,
         x: torch.Tensor,
         skip: torch.Tensor,
         time_steps: Optional[int] = None
     ) -> torch.Tensor:
-        """
-        Forward pass through decoder block
-        
-        Args:
-            x: Input spike tensor from previous layer
-            skip: Skip connection from encoder
-            time_steps: Number of time steps to process
-            
-        Returns:
-            spikes: Output spike tensor
-        """
+
         if time_steps is None:
             time_steps = self.time_window
-        
-        # Reset neurons
-        self.upconv.reset_neurons()
-        self.refine.reset_neurons()
-        
-        # # --- Debug logging ------------------------------------------------
-        # if True:  # always-on verbose debugging for now
-        #     print("[Decoder DEBUG] ---------------------------------------------")
-        #     print(f"  Expected skip_channels (init arg): {skip.shape[1] if skip is not None else 'N/A'}")
-        #     print(f"  Block config -> in_channels: {self.upconv.conv.in_channels}, "
-        #           f"out_channels: {self.upconv.conv.out_channels}, "
-        #           f"skip_channels (arg): {getattr(self, 'attention_gate', None) and 'attention' or 'N/A'}")
-        #     print(f"  Input tensor shape: {x.shape}")
-        #     print(f"  Skip tensor shape:  {skip.shape}")
-        #     print("-------------------------------------------------------------")
-        
-        # Process over time: upsample each timestep, then merge skip connections
+
         spike_outputs = []
 
         seq_len = x.shape[1] if x.dim() > 5 else 1
+        first_idx = 0
+        first_current = x[:, first_idx] if x.dim() > 5 else x
+
+        B, C, D, H, W = first_current.shape
+
+        upc = self.upconv.conv
+        kD, kH, kW = upc.kernel_size
+        sD, sH, sW = upc.stride
+        pD, pH, pW = upc.padding
+        dD, dH, dW = upc.dilation
+        opD, opH, opW = upc.output_padding
+
+        out_D = (D - 1) * sD - 2 * pD + dD * (kD - 1) + opD + 1
+        out_H = (H - 1) * sH - 2 * pH + dH * (kH - 1) + opH + 1
+        out_W = (W - 1) * sW - 2 * pW + dW * (kW - 1) + opW + 1
+        out_C = upc.out_channels
+
+        self.upconv.reset_neurons(B, out_C, out_D, out_H, out_W)
+        first_up = self.upconv(first_current)
+        target_spatial_size = first_up.shape[2:]
+        self.upconv.reset_neurons(B, out_C, out_D, out_H, out_W)
+
+        refine_out_C = self.refine.conv.out_channels
+        td, th, tw = target_spatial_size
+        self.refine.reset_neurons(B, refine_out_C, td, th, tw)
+
+        if skip.shape[2:] != target_spatial_size:
+            skip = F.interpolate(skip, size=target_spatial_size, mode="trilinear", align_corners=False)
 
         for t in range(time_steps):
-            # Safely fetch input frame: clamp t to available range
-            idx = t if t < seq_len else seq_len - 1  # reuse last frame if out of bounds
-            if t >= seq_len:
-                # Optional verbose logging for debugging oversized time window requests
-                if idx == seq_len - 1:
-                    print(f"[SpikingDecoderBlock] Requested timestep {t} exceeds input sequence length {seq_len}. Reusing last frame.")
-            current = x[:, idx] if x.dim() > 5 else x
-            # Upsample to match skip resolution
-            up = self.upconv(current)
-            # Ensure spatial dimensions match before merging
-            if up.shape[2:] != skip.shape[2:]:
-                # Identify which tensor is smaller and upscale it
-                if up.shape[2] < skip.shape[2]:
-                    # Upsample decoder features to match skip (rare case if decoder produced smaller spatial size)
-                    up = F.interpolate(up, size=skip.shape[2:], mode="trilinear", align_corners=False)
-                else:
-                    # Upsample skip connection to match decoder features (common for final decoder)
-                    skip = F.interpolate(skip, size=up.shape[2:], mode="trilinear", align_corners=False)
+            idx = t if t < seq_len else seq_len - 1
+            if t >= seq_len and not self._timestep_warned:
+                print(f"[SpikingDecoderBlock] Requested timestep {t} exceeds input sequence length {seq_len}. Reusing last frame.")
+                self._timestep_warned = True
 
-            # Merge with skip connection
+            current = x[:, idx] if x.dim() > 5 else x
+
+            up = self.upconv(current)
+
+            if up.shape[2:] != skip.shape[2:]:
+                up = F.interpolate(up, size=skip.shape[2:], mode="trilinear", align_corners=False)
+
             if self.skip_merge == "concatenate":
                 merged = torch.cat([up, skip], dim=1)
             elif self.skip_merge == "average":
@@ -343,25 +347,18 @@ class SpikingDecoderBlock(nn.Module):
                 merged = torch.cat([up, gated], dim=1)
             else:
                 merged = up
-            # Refine features
+
             if merged.shape[1] != self.refine.conv.in_channels:
-                # Adjust refine layer *once* to correct channel count, avoid repeated re-instantiation
-                if not hasattr(self, "_refine_adjusted"):
-                    # print(f"[Refine DEBUG] Adjusting refine layer to {merged.shape[1]} input channels (was {self.refine.conv.in_channels}).")
-                    tau_u_current = self.refine.neurons.tau_u if hasattr(self.refine, 'neurons') else 0.9
-                    self.refine = SpikingConv3d(
-                        merged.shape[1], self.refine.conv.out_channels, kernel_size=3,
-                        stride=1, padding=1, tau_u=tau_u_current
-                    )
-                    self._refine_adjusted = True
-                # else:
-                    # print("[Refine DEBUG] Skipping repeated refine adjustment; please verify architecture.")
+                raise RuntimeError(
+                    f"Channel mismatch in SpikingDecoderBlock: merged features have {merged.shape[1]} channels, "
+                    f"but refine layer expects {self.refine.conv.in_channels} channels."
+                )
+
             spikes = self.refine(merged)
             spike_outputs.append(spikes)
-        
-        # Stack spikes over time
-        spike_tensor = torch.stack(spike_outputs, dim=1)  # [B, T, C, D, H, W]
-        
+
+        spike_tensor = torch.stack(spike_outputs, dim=1)
+
         return spike_tensor
 
 
@@ -442,10 +439,11 @@ class OutputProjection(nn.Module):
             stride=1, padding=1, bias=False, groups=out_channels
         )
         
-        # Initialize smoothing kernel
+        # Initialize smoothing kernel as fixed averaging kernel
         with torch.no_grad():
             kernel = torch.ones(out_channels, 1, 3, 3, 3) / 27.0
             self.smooth.weight.data = kernel
+            self.smooth.weight.requires_grad_(False)
     
     def forward(self, spike_tensor: torch.Tensor) -> torch.Tensor:
         """

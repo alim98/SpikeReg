@@ -5,7 +5,7 @@ Loss functions for SpikeReg training
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, Union
 
 
 class NormalizedCrossCorrelation(nn.Module):
@@ -38,7 +38,7 @@ class NormalizedCrossCorrelation(nn.Module):
             warped: Warped moving image [B, 1, D, H, W]
             
         Returns:
-            ncc_loss: 1 - NCC (to minimize)
+            ncc_loss: -NCC (to minimize, since maximizing NCC is equivalent to minimizing -NCC)
         """
         B, C, D, H, W = fixed.shape
         
@@ -78,10 +78,23 @@ class MutualInformation(nn.Module):
     
     MI = H(F) + H(M) - H(F, M)
     where H is entropy
+    
+    WARNING: This implementation can consume excessive memory for large patches.
+    The joint histogram has shape [B, N, num_bins, num_bins] where N is the number
+    of voxels. For a 64³ patch with 32 bins, this requires >1GB per batch.
+    Consider using num_bins=8-16 for production use, or use NCC loss instead.
     """
     
-    def __init__(self, num_bins: int = 32, sigma: float = 1.0):
+    def __init__(self, num_bins: int = 16, sigma: float = 1.0):
         super().__init__()
+        if num_bins > 16:
+            import warnings
+            warnings.warn(
+                f"MutualInformation with num_bins={num_bins} can consume excessive memory. "
+                f"Consider using num_bins <= 16 or NCC loss for large patches.",
+                UserWarning,
+                stacklevel=2
+            )
         self.num_bins = num_bins
         self.sigma = sigma
     
@@ -233,7 +246,8 @@ class DiffusionRegularizer(nn.Module):
     """
     Diffusion regularization for smooth deformations
     
-    Penalizes first-order derivatives (gradient magnitude)
+    Penalizes first-order derivatives (L2 norm of gradients)
+    L2 diffusion: ||∇u||^2 = dx^2 + dy^2 + dz^2
     """
     
     def __init__(self, weight: float = 0.1):
@@ -242,7 +256,7 @@ class DiffusionRegularizer(nn.Module):
     
     def forward(self, displacement: torch.Tensor) -> torch.Tensor:
         """
-        Compute diffusion regularization
+        Compute diffusion regularization (L2 norm of gradients)
         
         Args:
             displacement: Displacement field [B, 3, D, H, W]
@@ -255,10 +269,10 @@ class DiffusionRegularizer(nn.Module):
         dy = torch.gradient(displacement, dim=3)[0]
         dz = torch.gradient(displacement, dim=4)[0]
         
-        # Compute gradient magnitude
-        grad_mag = torch.sqrt(dx ** 2 + dy ** 2 + dz ** 2 + 1e-8)
+        # Compute L2 norm of gradients (squared, no sqrt)
+        grad_l2 = dx ** 2 + dy ** 2 + dz ** 2
         
-        return self.weight * grad_mag.mean()
+        return self.weight * grad_l2.mean()
 
 
 class SpikingRegularizer(nn.Module):
@@ -279,38 +293,46 @@ class SpikingRegularizer(nn.Module):
         self.balance_weight = balance_weight
         self.target_rate = target_rate
     
-    def forward(self, spike_counts: Dict[str, float]) -> torch.Tensor:
+    def forward(self, spike_counts: Dict[str, Union[float, torch.Tensor]], device: Optional[torch.device] = None) -> torch.Tensor:
         """
         Compute spiking regularization
         
         Args:
-            spike_counts: Dictionary of spike rates per layer
+            spike_counts: Dictionary of spike rates per layer (as tensors)
+            device: Device to use for empty spike_counts (defaults to first tensor's device or parameters)
             
         Returns:
-            spike_loss: Scalar loss value
+            spike_loss: Scalar loss tensor
         """
-        total_spikes = 0
-        spike_imbalance = 0
+        if not spike_counts:
+            if device is None:
+                device = next(iter(self.parameters())).device if list(self.parameters()) else torch.device('cpu')
+            return torch.tensor(0.0, device=device)
         
-        # Debug removed - was causing massive log spam
-        # print("\n[SpikingRegularizer] Debug Info:")
-        # print("Spike counts input:", spike_counts)
+        spike_rates = list(spike_counts.values())
         
-        for layer_name, spike_rate in spike_counts.items():
-            total_spikes += spike_rate
-            
-            # Penalize deviation from target rate
-            spike_imbalance += (spike_rate - self.target_rate) ** 2
+        if isinstance(spike_rates[0], torch.Tensor):
+            # Ensure all tensors are scalars (reduce to mean if needed)
+            spike_rates_scalars = []
+            for rate in spike_rates:
+                if rate.numel() > 1:
+                    rate = rate.mean()
+                spike_rates_scalars.append(rate)
+            spike_rates_tensor = torch.stack(spike_rates_scalars)
+            device = spike_rates_tensor.device
+            total_spikes = spike_rates_tensor.sum()
+            target_rate_tensor = torch.tensor(self.target_rate, device=device, dtype=spike_rates_tensor.dtype)
+            spike_imbalance = ((spike_rates_tensor - target_rate_tensor) ** 2).sum()
+        else:
+            if device is None:
+                device = next(iter(self.parameters())).device if list(self.parameters()) else torch.device('cpu')
+            total_spikes = sum(spike_rates)
+            spike_imbalance = sum((r - self.target_rate) ** 2 for r in spike_rates)
+            total_spikes = torch.tensor(total_spikes, device=device)
+            spike_imbalance = torch.tensor(spike_imbalance, device=device)
         
-        # print("  Total spikes:", total_spikes)
-        # print("  Spike imbalance:", spike_imbalance)
-        # L1 penalty on total spikes
         spike_loss = self.spike_weight * total_spikes
-        # print("  Spike loss (L1):", spike_loss)
-
-        # L2 penalty on rate imbalance
         balance_loss = self.balance_weight * spike_imbalance
-        # print("  Balance loss (L2):", balance_loss)
         
         return spike_loss + balance_loss
 
@@ -349,6 +371,15 @@ class SpikeRegLoss(nn.Module):
             self.regularization_loss = BendingEnergy(regularization_weight)
         elif regularization_type == "diffusion":
             self.regularization_loss = DiffusionRegularizer(regularization_weight)
+        elif regularization_type == "grad_l2":
+            import warnings
+            warnings.warn(
+                "regularization_type 'grad_l2' is an alias for 'diffusion'. "
+                "Consider using 'diffusion' directly in your config.",
+                UserWarning,
+                stacklevel=2
+            )
+            self.regularization_loss = DiffusionRegularizer(regularization_weight)
         else:
             self.regularization_loss = None
         
@@ -365,7 +396,7 @@ class SpikeRegLoss(nn.Module):
         moving: torch.Tensor,
         displacement: torch.Tensor,
         warped: torch.Tensor,
-        spike_counts: Dict[str, float]
+        spike_counts: Dict[str, Union[float, torch.Tensor]]
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         Compute combined loss
@@ -391,7 +422,7 @@ class SpikeRegLoss(nn.Module):
             reg_loss = torch.tensor(0.0, device=fixed.device)
         
         # Spike regularization
-        spike_loss = self.spike_regularizer(spike_counts)
+        spike_loss = self.spike_regularizer(spike_counts, device=fixed.device)
         
         # Combine losses
         total_loss = (self.similarity_weight * sim_loss + 

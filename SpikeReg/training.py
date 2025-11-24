@@ -79,6 +79,17 @@ class SpikeRegTrainer:
         self.aim_repo_path = None
         self.aim_repo = None
         
+        # Initialize models
+        self.pretrained_model = None
+        self.spiking_model = None
+        self.current_model = None
+        self.registration = None
+        
+        # Training state (epoch-based only)
+        self.epoch = -1
+        self.best_val_loss = float('inf')
+        self.training_phase = 'pretrain'  # Track current phase: 'pretrain' or 'finetune'
+        
         if is_main_process:
             self.aim_repo_path = aim_repo or os.getenv("AIM_REPO") or os.path.dirname(self.checkpoint_dir)
             self.aim_repo = Repo(self.aim_repo_path)
@@ -86,16 +97,6 @@ class SpikeRegTrainer:
         else:
             with open(self.log_file, 'a') as f:
                 f.write("Aim logging disabled on non-main process (rank/LOCAL_RANK != 0)\n")
-        
-        # Initialize models
-        self.pretrained_model = None
-        self.spiking_model = None
-        self.current_model = None
-        
-        # Training state (epoch-based only)
-        self.epoch = 0
-        self.best_val_loss = float('inf')
-        self.training_phase = 'pretrain'  # Track current phase: 'pretrain' or 'finetune'
         
         # Initialize components
         self._init_models()
@@ -165,10 +166,11 @@ class SpikeRegTrainer:
         with open(self.log_file, 'a') as f:
             f.write(f"Setting up multi-GPU training on GPUs: {self.gpu_ids}\n")
         
-        # Set primary GPU
+        # Set primary GPU to cuda:0 always for DataParallel compatibility
+        # DataParallel will handle device placement across gpu_ids
         if 'cuda' in str(self.device):
-            torch.cuda.set_device(self.gpu_ids[0])
-            self.device = torch.device(f'cuda:{self.gpu_ids[0]}')
+            torch.cuda.set_device(0)
+            self.device = torch.device('cuda:0')
         
         print("Using DataParallel")
         with open(self.log_file, 'a') as f:
@@ -183,12 +185,8 @@ class SpikeRegTrainer:
         if not self.use_multi_gpu or len(self.gpu_ids) < 2:
             return model
         
-        if self.distributed:
-            # TODO: Implement DistributedDataParallel
-            # model = torch.nn.parallel.DistributedDataParallel(model, device_ids=self.gpu_ids)
-            model = torch.nn.DataParallel(model, device_ids=self.gpu_ids)
-        else:
-            model = torch.nn.DataParallel(model, device_ids=self.gpu_ids)
+        # Non-distributed multi-GPU via DataParallel
+        model = torch.nn.DataParallel(model, device_ids=self.gpu_ids)
         
         print(f"Model wrapped for multi-GPU training on devices: {self.gpu_ids}")
         with open(self.log_file, 'a') as f:
@@ -231,16 +229,19 @@ class SpikeRegTrainer:
     def _update_aim_tags(self):
         if self.aim_run is None or not self.is_main_process:
             return
-        
         try:
             self.aim_run.add_tag('spikereg')
-            
+        except Exception as e:
+            if 'UNIQUE' not in str(e) and 'already' not in str(e).lower():
+                print(f"Warning: Could not add Aim tag: {e}")
+        try:
             if self.training_phase == 'pretrain':
                 self.aim_run.add_tag('pretrain')
             elif self.training_phase == 'finetune':
                 self.aim_run.add_tag('finetune')
         except Exception as e:
-            print(f"Warning: Could not add Aim tag: {e}")
+            if 'UNIQUE' not in str(e) and 'already' not in str(e).lower():
+                print(f"Warning: Could not add Aim tag: {e}")
     
     def _init_models(self):
         """Initialize models based on training phase"""
@@ -254,14 +255,20 @@ class SpikeRegTrainer:
             self.current_model = self.pretrained_model
         else:
             # Initialize spiking model directly
+            self.training_phase = 'finetune'
+            self._update_aim_tags()
             self.spiking_model = SpikeRegUNet(self.config['model']).to(self.device)
             # Wrap for multi-GPU if enabled
             self.spiking_model = self._wrap_model_for_multi_gpu(self.spiking_model)
             self.current_model = self.spiking_model
             
             # Create iterative registration wrapper
+            base_spiking_model = self.spiking_model
+            if hasattr(self.spiking_model, 'module'):
+                base_spiking_model = self.spiking_model.module
+            
             self.registration = IterativeRegistration(
-                self.spiking_model,
+                base_spiking_model,
                 num_iterations=self.config['training'].get('num_iterations', 10),
                 early_stop_threshold=self.config['training'].get('early_stop_threshold', 0.001)
             )
@@ -271,12 +278,12 @@ class SpikeRegTrainer:
     def _init_spiking_model_for_loading(self):
         """Initialize spiking model structure for loading a converted checkpoint"""
         if self.spiking_model is None:
-            from SpikeReg.models import SpikeRegUNet
+            from .models import SpikeRegUNet
             self.spiking_model = SpikeRegUNet(self.config['model']).to(self.device)
             self.spiking_model = self._wrap_model_for_multi_gpu(self.spiking_model)
             self.current_model = self.spiking_model
             
-            from SpikeReg.registration import IterativeRegistration
+            from .registration import IterativeRegistration
             base_spiking_model = self.spiking_model
             if hasattr(self.spiking_model, 'module'):
                 base_spiking_model = self.spiking_model.module
@@ -346,7 +353,7 @@ class SpikeRegTrainer:
         """Initialize loss function"""
         loss_config = self.config['training']['loss']
         
-        if self.current_model == self.pretrained_model:
+        if self.training_phase == 'pretrain':
             # Simple loss for pretraining
             self.criterion = nn.MSELoss()
             with open(self.log_file, 'a') as f:
@@ -366,22 +373,52 @@ class SpikeRegTrainer:
             f.write(f"Initialized loss function: {self.criterion.__class__.__name__}\n")
             f.write(f"Loss config: {json.dumps(loss_config, indent=2)}\n")
     
+    def _freeze_batch_norm(self):
+        """Freeze all BatchNorm3d layers in the current model"""
+        if self.current_model is None:
+            return
+        
+        model = self.current_model
+        if hasattr(model, 'module'):
+            model = model.module
+        
+        frozen_count = 0
+        for m in model.modules():
+            if isinstance(m, nn.BatchNorm3d):
+                m.eval()
+                m.weight.requires_grad_(False)
+                m.bias.requires_grad_(False)
+                frozen_count += 1
+        
+        print(f"Frozen {frozen_count} BatchNorm3d layers for SNN fine-tune")
+        with open(self.log_file, 'a') as f:
+            f.write(f"Frozen {frozen_count} BatchNorm3d layers for SNN fine-tune\n")
+    
     def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
         """Train for one epoch"""
         self.current_model.train()
-        epoch_losses = []
-        epoch_metrics = {}
-        # Aggregate per-component training loss averages
-        train_loss_component_sums: Dict[str, float] = {}
-        train_loss_component_count: int = 0
         with open(self.log_file, 'a') as f:
             f.write(f"Starting training epoch {self.epoch}\n")
         
         progress_bar = tqdm(train_loader, desc=f"Epoch {self.epoch}")
         
-        with open(os.path.join(self.log_dir, "stdout.txt"), "a") as f:
-            with redirect_stdout(f):
-                for batch_idx, batch in enumerate(progress_bar):
+        if self.is_main_process:
+            with open(os.path.join(self.log_dir, "stdout.txt"), "a") as f:
+                with redirect_stdout(f):
+                    epoch_metrics = self._train_epoch_inner(train_loader, progress_bar)
+        else:
+            epoch_metrics = self._train_epoch_inner(train_loader, progress_bar)
+        
+        return epoch_metrics
+    
+    def _train_epoch_inner(self, train_loader, progress_bar):
+        """Inner training loop without stdout redirection"""
+        epoch_losses = []
+        epoch_metrics = {}
+        train_loss_component_sums: Dict[str, float] = {}
+        train_loss_component_count: int = 0
+        
+        for batch_idx, batch in enumerate(progress_bar):
                     # Get data
                     fixed = batch['fixed'].to(self.device)
                     moving = batch['moving'].to(self.device)
@@ -390,7 +427,7 @@ class SpikeRegTrainer:
                     self.optimizer.zero_grad()
                     
                     # Forward pass
-                    if self.current_model == self.pretrained_model:
+                    if self.training_phase == 'pretrain':
                         # Pretrained model - direct prediction
                         displacement = self.current_model(fixed, moving)
                         warped = self.spatial_transformer(moving, displacement)
@@ -407,6 +444,8 @@ class SpikeRegTrainer:
                         
                     else:
                         # Spiking model - iterative registration
+                        if self.registration is None:
+                            raise RuntimeError("Registration not initialized for finetune phase")
                         output = self.registration(fixed, moving, return_all_iterations=False)
                         displacement = output['displacement']
                         warped = output['warped']
@@ -472,98 +511,91 @@ class SpikeRegTrainer:
     def validate(self, val_loader: DataLoader) -> Dict[str, float]:
         """Validate model"""
         self.current_model.eval()
-        val_losses = []
-        val_dice_scores = []
-        val_jacobian_stats = []
-        # Aggregate per-component validation loss averages
-        val_loss_component_sums: Dict[str, float] = {}
-        val_loss_component_count: int = 0
         with open(self.log_file, 'a') as f:
             f.write(f"Starting validation epoch {self.epoch}\n")
         
         with torch.no_grad():
-            with open(os.path.join(self.log_dir, "stdout.txt"), "a") as f:
-                with redirect_stdout(f):
-                    for batch in tqdm(val_loader, desc="Validation"):
-                        # Get data
-                        fixed = batch['fixed'].to(self.device)
-                        moving = batch['moving'].to(self.device)
-                        
-                        # Forward pass
-                        if self.current_model == self.pretrained_model:
-                            displacement = self.current_model(fixed, moving)
-                            warped = self.spatial_transformer(moving, displacement)
-                            loss = self.criterion(warped, fixed)
-                            loss_value = float(loss.item())
-                            val_losses.append(loss_value)
-                            # record val components for pretrain
-                            val_loss_dict = {'mse': loss_value, 'total': loss_value}
-                            try:
-                                for comp_name, comp_value in val_loss_dict.items():
-                                    value_float = float(comp_value)
-                                    val_loss_component_sums[comp_name] = val_loss_component_sums.get(comp_name, 0.0) + value_float
-                                val_loss_component_count += 1
-                            except Exception:
-                                pass
-                        else:
-                            output = self.registration(fixed, moving)
-                            displacement = output['displacement']
-                            warped = output['warped']
-                            
-                            # Compute loss
-                            loss, val_loss_dict = self.criterion(
-                                fixed, moving, displacement, warped, 
-                                output.get('spike_counts', {})
-                            )
-                            val_losses.append(loss.item())
-                            # aggregate per-component validation losses if provided
-                            try:
-                                for comp_name, comp_value in val_loss_dict.items():
-                                    value_float = float(comp_value.item() if torch.is_tensor(comp_value) else comp_value)
-                                    val_loss_component_sums[comp_name] = val_loss_component_sums.get(comp_name, 0.0) + value_float
-                                val_loss_component_count += 1
-                            except Exception:
-                                pass
-                            with open(self.log_file, 'a') as f:
-                                f.write(f"Validation output similarity score: {output['similarity_scores'].tolist()}\n")
-                                f.write(f"Spike counts number: {output['spike_count_history_number']}\n")
-                                if 'hasNaN' in output and output['hasNaN']:
-                                    f.write(f"Warning: Has NaN in displacement or warped, displacement: {output['displacement']}\n")
-                        
-                        # Compute metrics
-                        if 'segmentation_fixed' in batch and 'segmentation_moving' in batch:
-                            seg_fixed = batch['segmentation_fixed'].to(self.device)
-                            seg_moving = batch['segmentation_moving'].to(self.device)
-                            # Warp segmentation labels with nearest neighbor interpolation
-                            seg_warped = self.seg_spatial_transformer(seg_moving.float(), displacement).long()
-                            
-                            # Dice score
-                            dice = dice_score(seg_warped, seg_fixed)
-                            # average over batch and classes to get a single score
-                            val_dice_scores.append(dice.mean().item())
-                        
-                        # Jacobian determinant statistics
-                        jac_stats = jacobian_determinant_stats(displacement)
-                        val_jacobian_stats.append(jac_stats)
+            if self.is_main_process:
+                with open(os.path.join(self.log_dir, "stdout.txt"), "a") as f:
+                    with redirect_stdout(f):
+                        metrics = self._validate_inner(val_loader)
+            else:
+                metrics = self._validate_inner(val_loader)
         
-        # Compute validation metrics
+        return metrics
+    def _validate_inner(self, val_loader):
+        val_losses = []
+        val_dice_scores = []
+        val_jacobian_stats = []
+        val_loss_component_sums: Dict[str, float] = {}
+        val_loss_component_count: int = 0
+
+        for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validation")):
+            fixed = batch['fixed'].to(self.device)
+            moving = batch['moving'].to(self.device)
+
+            if self.training_phase == 'pretrain':
+                displacement = self.current_model(fixed, moving)
+                warped = self.spatial_transformer(moving, displacement)
+                loss = self.criterion(warped, fixed)
+                loss_value = float(loss.item())
+                val_losses.append(loss_value)
+                val_loss_dict = {'mse': loss_value, 'total': loss_value}
+                for comp_name, comp_value in val_loss_dict.items():
+                    val_loss_component_sums[comp_name] = val_loss_component_sums.get(comp_name, 0.0) + float(comp_value)
+                val_loss_component_count += 1
+            else:
+                if self.registration is None:
+                    raise RuntimeError("Registration not initialized for finetune phase")
+                output = self.registration(fixed, moving, return_all_iterations=False)
+                displacement = output['displacement']
+                warped = output['warped']
+
+                loss, val_loss_dict = self.criterion(
+                    fixed, moving, displacement, warped,
+                    output.get('spike_counts', {})
+                )
+                val_losses.append(float(loss.item()))
+
+                for comp_name, comp_value in val_loss_dict.items():
+                    val_loss_component_sums[comp_name] = val_loss_component_sums.get(comp_name, 0.0) + float(comp_value.item() if torch.is_tensor(comp_value) else comp_value)
+                val_loss_component_count += 1
+
+                if output.get('hasNaN', False):
+                    with open(self.log_file, 'a') as f:
+                        f.write("Warning: Has NaN in displacement or warped\n")
+
+            if 'segmentation_fixed' in batch and 'segmentation_moving' in batch:
+                seg_fixed = batch['segmentation_fixed'].to(self.device)
+                seg_moving = batch['segmentation_moving'].to(self.device)
+                seg_warped = self.seg_spatial_transformer(seg_moving.float(), displacement).long()
+
+                dice = dice_score(seg_warped, seg_fixed)
+
+                if batch_idx == 0 and self.epoch % 5 == 0:
+                    print(f"[validate] Dice sanity check: min={dice.min().item():.4f}, max={dice.max().item():.4f}, mean={dice.mean().item():.4f}, shape={dice.shape}")
+
+                val_dice_scores.append(float(dice.mean().item()))
+
+            jac_stats = jacobian_determinant_stats(displacement)
+            val_jacobian_stats.append(jac_stats)
+
         metrics = {
-            'val_loss': np.mean(val_losses),
-            'val_dice': np.mean(val_dice_scores) if val_dice_scores else 0.0,
-            'val_jac_negative': np.mean([s['negative_fraction'] for s in val_jacobian_stats])
+            'val_loss': float(np.mean(val_losses)) if val_losses else 0.0,
+            'val_dice': float(np.mean(val_dice_scores)) if val_dice_scores else 0.0,
+            'val_jac_negative': float(np.mean([s['negative_fraction'] for s in val_jacobian_stats])) if val_jacobian_stats else 0.0
         }
-        # Add per-component mean validation losses for the epoch
+
         if val_loss_component_count > 0:
             for comp_name, comp_sum in val_loss_component_sums.items():
                 metrics[f'val_loss_{comp_name}'] = comp_sum / val_loss_component_count
 
         with open(self.log_file, 'a') as f:
             f.write(f"Completed validation epoch {self.epoch}\n")
-            # Log only summary metrics, not all individual losses (reduces log size)
             f.write(f"Validation metrics: {json.dumps(metrics)}\n")
-        
+
         return metrics
-    
+
     def train(
         self,
         train_loader: DataLoader,
@@ -580,6 +612,9 @@ class SpikeRegTrainer:
         
         with open(self.log_file, 'a') as f:
             f.write(f"Resuming training from epoch {start_epoch} (completed epoch {self.epoch}), continuing to {num_epochs}\n")
+        
+        if self.training_phase == 'finetune':
+            self._freeze_batch_norm()
         
         for epoch in range(start_epoch, num_epochs):
             self.epoch = epoch
@@ -664,6 +699,8 @@ class SpikeRegTrainer:
             early_stop_threshold=self.config['training'].get('early_stop_threshold', 0.001)
         )
 
+        self._freeze_batch_norm()
+
         with open(self.log_file, 'a') as f:
             f.write(f"Converted to spiking model: {self.spiking_model.__class__.__name__}\n")
         with open(self.log_file, 'a') as f:
@@ -700,39 +737,6 @@ class SpikeRegTrainer:
         print(f"Saved checkpoint: {path}")
         with open(self.log_file, 'a') as f:
             f.write(f"Saved checkpoint: {path}\n")
-    
-    # def _cleanup_old_checkpoints(self):
-    #     """Remove old epoch checkpoints, keeping only the most recent N"""
-    #     keep_last = self.config['training'].get('save_keep_last', 5)
-    #     if keep_last <= 0:
-    #         return  # Keep all checkpoints
-        
-    #     # Find all epoch checkpoints
-    #     import glob
-    #     import re
-    #     checkpoint_pattern = os.path.join(self.checkpoint_dir, 'model_epoch_*.pth')
-    #     checkpoints = glob.glob(checkpoint_pattern)
-        
-    #     # Extract epoch numbers and sort
-    #     epoch_ckpts = []
-    #     for ckpt in checkpoints:
-    #         match = re.search(r'model_epoch_(\d+)\.pth', ckpt)
-    #         if match:
-    #             epoch_num = int(match.group(1))
-    #             epoch_ckpts.append((epoch_num, ckpt))
-        
-    #     # Sort by epoch number (newest first)
-    #     epoch_ckpts.sort(reverse=True)
-        
-    #     # Remove old checkpoints beyond keep_last
-    #     for epoch_num, ckpt_path in epoch_ckpts[keep_last:]:
-    #         try:
-    #             os.remove(ckpt_path)
-    #             with open(self.log_file, 'a') as f:
-    #                 f.write(f"Removed old checkpoint: {ckpt_path}\n")
-    #         except Exception as e:
-    #             with open(self.log_file, 'a') as f:
-    #                 f.write(f"Failed to remove checkpoint {ckpt_path}: {e}\n")
     def load_checkpoint(self, filename: str):
         """Load model checkpoint with staggered delays to avoid concurrent file access race conditions"""
         import sys, numpy as np
@@ -759,6 +763,14 @@ class SpikeRegTrainer:
         print(f"Loading checkpoint from: {path}")
         
         # 0) legacy NumPy aliases MUST be defined before torch.load
+        # WARNING: This is a workaround for old pickles. Only use with trusted checkpoints.
+        import warnings
+        warnings.warn(
+            "Loading checkpoint with legacy NumPy deserialization workaround. "
+            "Only load checkpoints from trusted sources.",
+            UserWarning,
+            stacklevel=2
+        )
         sys.modules.setdefault('numpy._core', np.core)
         sys.modules.setdefault('numpy._core.multiarray', np.core.multiarray)
         
@@ -777,10 +789,20 @@ class SpikeRegTrainer:
                 time.sleep(0.5 * (attempt + 1))
                 print(f"Retry {attempt + 1}/{max_retries} loading checkpoint due to: {e}")
 
-        # 1) choose the state dict
+        # 1) Check training_phase from checkpoint and auto-switch model if needed
+        checkpoint_phase = checkpoint.get('training_phase', 'pretrain')
+        if checkpoint_phase == 'finetune' and self.spiking_model is None:
+            print(f"[load_checkpoint] Checkpoint is from finetune phase but spiking model not initialized. Initializing now...")
+            self._init_spiking_model_for_loading()
+            self.current_model = self.spiking_model
+        elif checkpoint_phase == 'pretrain' and self.current_model != self.pretrained_model and self.pretrained_model is not None:
+            print(f"[load_checkpoint] Checkpoint is from pretrain phase. Switching to pretrained model...")
+            self.current_model = self.pretrained_model
+
+        # 2) choose the state dict
         state = checkpoint.get("model_state_dict", checkpoint)
 
-        # 2) Handle DataParallel/DDP prefix
+        # 3) Handle DataParallel/DDP prefix
         # Check if current model is wrapped in DataParallel
         is_wrapped = isinstance(self.current_model, (torch.nn.DataParallel, torch.nn.parallel.DistributedDataParallel))
         
@@ -794,15 +816,18 @@ class SpikeRegTrainer:
             # Checkpoint doesn't have prefix but model does - add it
             state = {"module." + k: v for k, v in state.items()}
 
-        # 2.5) Check for channel mismatches in decoder blocks BEFORE loading
+        # 3.5) Check for channel mismatches in decoder blocks BEFORE loading
         model_dict = self.current_model.state_dict()
         keys_to_remove = []
+        skipped_layers = []
         for key in list(state.keys()):
             if 'decoder_blocks' in key and 'upconv' in key and 'weight' in key:
                 if key in model_dict:
                     checkpoint_shape = state[key].shape
                     model_shape = model_dict[key].shape
                     if checkpoint_shape != model_shape:
+                        layer_name = key.split('.upconv')[0]
+                        skipped_layers.append(f"{layer_name}: {checkpoint_shape} -> {model_shape}")
                         print(f"[load_checkpoint] Channel mismatch in {key}: checkpoint {checkpoint_shape} vs model {model_shape}. Skipping this weight (layer will use default initialization).")
                         keys_to_remove.append(key)
                         # Also remove related bias and bn weights
@@ -818,15 +843,19 @@ class SpikeRegTrainer:
         for key in keys_to_remove:
             if key in state:
                 del state[key]
+        
+        if skipped_layers and self.aim_run is not None:
+            self.aim_run["skipped_layers"] = skipped_layers
+            print(f"[load_checkpoint] Logged {len(skipped_layers)} skipped layers to Aim")
 
-        # 3) load weights ONCE (lenient)
+        # 4) load weights ONCE (lenient)
         missing, unexpected = self.current_model.load_state_dict(state, strict=False)
         has_arch_mismatch = bool(missing) or bool(unexpected)
         if has_arch_mismatch:
             print("[load_checkpoint] missing:", missing)
             print("[load_checkpoint] unexpected:", unexpected)
 
-        # 4) restore training state (guarded)
+        # 5) restore training state (guarded)
         self.epoch         = int(checkpoint.get('epoch', 0))
         self.best_val_loss = float(checkpoint.get('best_val_loss', float('inf')))
         self.training_phase = checkpoint.get('training_phase', 'pretrain')  # Default to pretrain if not saved
@@ -998,10 +1027,7 @@ def main_cli():
     if args.start_from_checkpoint:
         print(f"Resuming from checkpoint: {args.start_from_checkpoint}")
         trainer.load_checkpoint(args.start_from_checkpoint)
-        if trainer.training_phase == 'pretrain':
-            trainer.save_checkpoint('pretrained_model.pth')
-            trainer.epoch = -1
-        print(f"Resumed from epoch {trainer.epoch}")
+        print(f"Resumed from epoch {trainer.epoch}, training phase: {trainer.training_phase}")
 
     # Training phases per config
     pretrain_epochs = int(cfg.get('training', {}).get('pretrain_epochs', 0))
@@ -1028,10 +1054,14 @@ def main_cli():
     else:
         # Check if we need to run pretrain
         if do_pretrain and trainer.pretrained_model is not None and pretrain_epochs > 0:
+            # Check if we're resuming pretrain (checkpoint loaded and in pretrain phase)
+            resuming_pretrain = args.start_from_checkpoint and trainer.training_phase == 'pretrain' and trainer.epoch >= 0
+            
             if pretrain_complete:
                 print(f"Pretrain already complete! Found {pretrained_model_path}")
                 print("Skipping pretrain phase, loading pretrained model...")
-                trainer.load_checkpoint('pretrained_model.pth')
+                if not resuming_pretrain:
+                    trainer.load_checkpoint('pretrained_model.pth')
                 
                 if not converted_complete:
                     print("Converting pretrained model to spiking...")
@@ -1068,9 +1098,12 @@ def main_cli():
                         trainer.epoch = -1
                         trainer.save_checkpoint('converted_model.pth')
                     else:
-                        trainer.load_checkpoint('converted_model.pth')
+                        if not resuming_pretrain:
+                            trainer.load_checkpoint('converted_model.pth')
             else:
-                # Run pretrain
+                # Run pretrain (either fresh start or resume)
+                if resuming_pretrain:
+                    print(f"Resuming pretrain from epoch {trainer.epoch}, continuing to epoch {pretrain_epochs}")
                 trainer.train(train_loader, val_loader, num_epochs=pretrain_epochs)
                 trainer.save_checkpoint('pretrained_model.pth')
                 trainer.convert_to_spiking()
@@ -1127,13 +1160,20 @@ def main_cli():
                     print("Warning: No pretrained/converted model found for finetune. Skipping finetune.")
                     return
             
-            # Reset epoch counter for finetune phase
+            # Check if we're resuming finetune
+            resuming_finetune = args.start_from_checkpoint and trainer.training_phase == 'finetune' and trainer.epoch >= 0
+            
+            # Reset epoch counter for finetune phase only if not resuming
             # If we just converted (training_phase='finetune' but epoch is high from pretrain), reset it
             # If training_phase is not 'finetune', also reset it
-            if trainer.training_phase == 'finetune' and trainer.epoch >= pretrain_epochs:
-                trainer.epoch = -1
-            elif trainer.training_phase != 'finetune':
-                trainer.epoch = -1
+            if not resuming_finetune:
+                if trainer.training_phase == 'finetune' and trainer.epoch >= pretrain_epochs:
+                    trainer.epoch = -1
+                elif trainer.training_phase != 'finetune':
+                    trainer.epoch = -1
+            
+            if resuming_finetune:
+                print(f"Resuming finetune from epoch {trainer.epoch}, continuing to epoch {finetune_epochs}")
             trainer.train(train_loader, val_loader, num_epochs=finetune_epochs)
             trainer.save_checkpoint('final_model.pth')
 

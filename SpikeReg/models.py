@@ -4,6 +4,7 @@ Spiking U-Net model for medical image registration
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 from .layers import (
     SpikingEncoderBlock, SpikingDecoderBlock, 
@@ -109,6 +110,7 @@ class SpikeRegUNet(nn.Module):
         
         # Input spike encoding parameters
         self.register_buffer('spike_encoding_window', torch.tensor(config.get('input_time_window', 10)))
+        self._spike_rate_checked = False
     
     def encode_to_spikes(self, x: torch.Tensor, time_window: int = 10) -> torch.Tensor:
         """
@@ -126,6 +128,14 @@ class SpikeRegUNet(nn.Module):
         
         # Ensure values are in [0, 1]
         x = torch.clamp(x, 0, 1)
+        
+        # Sanity check: verify input spike rate (only on first batch)
+        if not self._spike_rate_checked:
+            mean_rate = x.mean().item()
+            print(f"Input spike rate (mean): {mean_rate:.4f}")
+            if mean_rate < 0.01:
+                print(f"Warning: Input spike rate is very low ({mean_rate:.4f}). Input may be under-stimulated, which could cause dead gradients.")
+            self._spike_rate_checked = True
         
         # Generate Poisson spike trains
         spikes = []
@@ -193,7 +203,7 @@ class SpikeRegUNet(nn.Module):
                 print(f"Warning: NaN detected in encoder_{i} spike tensor!")
 
             # Record spike statistics
-            spike_counts[f'encoder_{i}'] = spike_tensor.sum().item() / spike_tensor.numel()
+            spike_counts[f'encoder_{i}'] = spike_tensor.mean()
             spike_counts_number[f'encoder_{i}'] = spike_tensor.sum().cpu().detach().numpy()
         # Bottleneck
         self.bottleneck.reset_neurons()
@@ -206,7 +216,7 @@ class SpikeRegUNet(nn.Module):
                 print("Warning: NaN detected in bottleneck spikes!")
         
         x = torch.stack(bottleneck_spikes, dim=1)
-        spike_counts['bottleneck'] = x.sum().item() / x.numel()
+        spike_counts['bottleneck'] = x.mean()
         spike_counts_number['bottleneck'] = x.sum().cpu().detach().numpy()
         
         # Decoder path
@@ -225,7 +235,7 @@ class SpikeRegUNet(nn.Module):
             decoder_features.append(x.mean(dim=1))
             
             # Record spike statistics
-            spike_counts[f'decoder_{i}'] = x.sum().item() / x.numel()
+            spike_counts[f'decoder_{i}'] = x.mean()
             spike_counts_number[f'decoder_{i}'] = x.sum().cpu().detach().numpy()
         
         # Output projection
@@ -275,6 +285,7 @@ class PretrainedUNet(nn.Module):
         self.in_channels = config.get('in_channels', 2)
         self.encoder_channels = config.get('encoder_channels', [16, 32, 64, 128])
         self.decoder_channels = config.get('decoder_channels', [64, 32, 16, 16])
+        self.skip_merge = config.get('skip_merge', ['concatenate', 'average', 'concatenate', 'none'])
         
         # Encoder
         self.encoders = nn.ModuleList()
@@ -291,30 +302,48 @@ class PretrainedUNet(nn.Module):
             self.encoders.append(encoder)
             in_ch = out_ch
         
-        # Decoder
+        # Decoder - match SpikeRegUNet skip_merge logic exactly
         self.decoders = nn.ModuleList()
-        # Number of encoder levels
+        self.decoder_refines = nn.ModuleList()
+        self.decoder_skip_adapters = nn.ModuleList()
         N = len(self.encoder_channels)
         prev_ch = self.encoder_channels[-1]
         for i, out_ch in enumerate(self.decoder_channels):
-            # Decoder 0 takes only the bottleneck features (prev_ch)
-            # Subsequent decoders concatenate with the corresponding skip feature
-            if 0 < i < N:  # skip connections available for decoders 1 .. N-1
-                skip_ch = self.encoder_channels[-(i+1)]
-                in_ch = prev_ch + skip_ch
-            else:
-                # i == 0 (first decoder) OR i >= N (should not occur)
-                in_ch = prev_ch
-            
-            decoder = nn.Sequential(
-                nn.ConvTranspose3d(in_ch, out_ch, 2, stride=2),
-                nn.BatchNorm3d(out_ch),
-                nn.ReLU(inplace=True),
-                nn.Conv3d(out_ch, out_ch, 3, padding=1),
+            upconv = nn.Sequential(
+                nn.ConvTranspose3d(prev_ch, out_ch, 2, stride=2),
                 nn.BatchNorm3d(out_ch),
                 nn.ReLU(inplace=True)
             )
-            self.decoders.append(decoder)
+            self.decoders.append(upconv)
+            
+            # Get skip channels for this decoder level
+            if i + 2 <= len(self.encoder_channels):
+                skip_ch = self.encoder_channels[-(i+2)]
+            else:
+                skip_ch = self.encoder_channels[0]
+            
+            # Determine refine input channels based on skip_merge strategy
+            merge_strategy = self.skip_merge[i] if i < len(self.skip_merge) else 'none'
+            if merge_strategy in ["concatenate", "attention"]:
+                refine_in_ch = out_ch + skip_ch
+            else:
+                refine_in_ch = out_ch
+            
+            # Create skip adapter for average merge if channels don't match
+            skip_adapter = None
+            if merge_strategy == "average" and skip_ch != out_ch:
+                skip_adapter = nn.Sequential(
+                    nn.Conv3d(skip_ch, out_ch, kernel_size=1, bias=False),
+                    nn.BatchNorm3d(out_ch)
+                )
+            self.decoder_skip_adapters.append(skip_adapter)
+            
+            refine = nn.Sequential(
+                nn.Conv3d(refine_in_ch, out_ch, 3, padding=1),
+                nn.BatchNorm3d(out_ch),
+                nn.ReLU(inplace=True)
+            )
+            self.decoder_refines.append(refine)
             prev_ch = out_ch
         
         # Output
@@ -336,12 +365,37 @@ class PretrainedUNet(nn.Module):
         # ------------------------------------------------------------------
         # Debug code removed - was causing massive log spam with DataParallel
         
-        # Decoder
-        for i, decoder in enumerate(self.decoders):
-            if i > 0 and i <= len(skip_features):
-                skip = skip_features[-(i+1)]
-                x = torch.cat([x, skip], dim=1)
+        # Decoder - match SpikeRegUNet skip_merge logic exactly
+        for i, (decoder, refine) in enumerate(zip(self.decoders, self.decoder_refines)):
             x = decoder(x)
+            
+            # Get skip feature for this decoder level
+            skip_idx = -(i+2)
+            if skip_idx >= -len(skip_features):
+                skip = skip_features[skip_idx]
+            else:
+                skip = skip_features[0]
+            
+            # Apply skip_merge strategy
+            merge_strategy = self.skip_merge[i] if i < len(self.skip_merge) else 'none'
+            
+            # Ensure spatial dimensions match
+            if x.shape[2:] != skip.shape[2:]:
+                skip = F.interpolate(skip, size=x.shape[2:], mode="trilinear", align_corners=False)
+            
+            if merge_strategy == "concatenate":
+                x = torch.cat([x, skip], dim=1)
+            elif merge_strategy == "average":
+                skip_adapter = self.decoder_skip_adapters[i]
+                if skip_adapter is not None:
+                    skip = skip_adapter(skip)
+                x = (x + skip) / 2.0
+            elif merge_strategy == "attention":
+                x = torch.cat([x, skip], dim=1)
+            else:
+                pass
+            
+            x = refine(x)
         
         # Output
         displacement = self.output(x)
@@ -392,40 +446,83 @@ def convert_pretrained_to_spiking(
         spiking_enc.conv.bn.running_var = bn_var.clone()
     
     # Transfer decoder weights
-    for i, (pretrained_dec, spiking_dec) in enumerate(
-        zip(pretrained_model.decoders, spiking_model.decoder_blocks)
+    for i, (pretrained_dec, pretrained_refine, spiking_dec) in enumerate(
+        zip(pretrained_model.decoders, pretrained_model.decoder_refines, spiking_model.decoder_blocks)
     ):
-        # Extract conv and bn from pretrained sequential
-        conv_weight = pretrained_dec[0].weight.data
-        conv_bias = pretrained_dec[0].bias.data if pretrained_dec[0].bias is not None else None
-        bn_weight = pretrained_dec[1].weight.data
-        bn_bias = pretrained_dec[1].bias.data
-        bn_mean = pretrained_dec[1].running_mean
-        bn_var = pretrained_dec[1].running_var
+        # Transfer upconv weights (ConvTranspose3d)
+        upconv_weight = pretrained_dec[0].weight.data
+        upconv_bias = pretrained_dec[0].bias.data if pretrained_dec[0].bias is not None else None
+        upconv_bn_weight = pretrained_dec[1].weight.data
+        upconv_bn_bias = pretrained_dec[1].bias.data
+        upconv_bn_mean = pretrained_dec[1].running_mean
+        upconv_bn_var = pretrained_dec[1].running_var
         
-        # Ensure input-channel dimension matches target layer for ALL decoders
-        # ConvTranspose3d weight shape: [in_channels, out_channels, k, k, k]
+        # With unified architectures, channels should match - warn if they don't
         in_ch_required = spiking_dec.upconv.conv.in_channels
-        if conv_weight.shape[0] != in_ch_required:
-            if conv_weight.shape[0] > in_ch_required:
-                print(f"[convert_pretrained_to_spiking] Trimming decoder {i} upconv weights from {conv_weight.shape[0]} to {in_ch_required} input channels")
-                conv_weight = conv_weight[:in_ch_required]
-            else:
-                # pad with zeros if pretrained has fewer channels (unlikely)
-                pad_size = in_ch_required - conv_weight.shape[0]
-                print(f"[convert_pretrained_to_spiking] Padding decoder {i} upconv weights with {pad_size} zero channels to reach {in_ch_required}")
-                pad = torch.zeros(pad_size, conv_weight.shape[1], *conv_weight.shape[2:], device=conv_weight.device)
-                conv_weight = torch.cat([conv_weight, pad], dim=0)
+        if upconv_weight.shape[0] != in_ch_required:
+            raise RuntimeError(
+                f"[convert_pretrained_to_spiking] Architecture mismatch in decoder {i} upconv: "
+                f"pretrained has {upconv_weight.shape[0]} input channels, "
+                f"spiking model expects {in_ch_required}. "
+                f"Architectures must match exactly - check encoder_channels and decoder_channels config."
+            )
         
-        # Transfer to spiking layer
-        spiking_dec.upconv.conv.weight.data = conv_weight.clone()
-        if conv_bias is not None:
-            spiking_dec.upconv.conv.bias.data = conv_bias.clone()
+        # Transfer upconv to spiking layer
+        spiking_dec.upconv.conv.weight.data = upconv_weight.clone()
+        if upconv_bias is not None:
+            spiking_dec.upconv.conv.bias.data = upconv_bias.clone()
         
-        spiking_dec.upconv.bn.weight.data = bn_weight.clone()
-        spiking_dec.upconv.bn.bias.data = bn_bias.clone()
-        spiking_dec.upconv.bn.running_mean = bn_mean.clone()
-        spiking_dec.upconv.bn.running_var = bn_var.clone()
+        spiking_dec.upconv.bn.weight.data = upconv_bn_weight.clone()
+        spiking_dec.upconv.bn.bias.data = upconv_bn_bias.clone()
+        spiking_dec.upconv.bn.running_mean = upconv_bn_mean.clone()
+        spiking_dec.upconv.bn.running_var = upconv_bn_var.clone()
+        
+        # Transfer skip adapter weights if they exist (for average merge with channel mismatch)
+        pretrained_skip_adapter = pretrained_model.decoder_skip_adapters[i]
+        if pretrained_skip_adapter is not None and spiking_dec.skip_adapter is not None:
+            adapter_weight = pretrained_skip_adapter[0].weight.data
+            adapter_bias = pretrained_skip_adapter[0].bias if pretrained_skip_adapter[0].bias is not None else None
+            adapter_bn_weight = pretrained_skip_adapter[1].weight.data
+            adapter_bn_bias = pretrained_skip_adapter[1].bias.data
+            adapter_bn_mean = pretrained_skip_adapter[1].running_mean
+            adapter_bn_var = pretrained_skip_adapter[1].running_var
+            
+            spiking_dec.skip_adapter[0].weight.data = adapter_weight.clone()
+            if adapter_bias is not None:
+                spiking_dec.skip_adapter[0].bias.data = adapter_bias.clone()
+            
+            spiking_dec.skip_adapter[1].weight.data = adapter_bn_weight.clone()
+            spiking_dec.skip_adapter[1].bias.data = adapter_bn_bias.clone()
+            spiking_dec.skip_adapter[1].running_mean = adapter_bn_mean.clone()
+            spiking_dec.skip_adapter[1].running_var = adapter_bn_var.clone()
+        
+        # Transfer refine weights (Conv3d)
+        refine_weight = pretrained_refine[0].weight.data
+        refine_bias = pretrained_refine[0].bias.data if pretrained_refine[0].bias is not None else None
+        refine_bn_weight = pretrained_refine[1].weight.data
+        refine_bn_bias = pretrained_refine[1].bias.data
+        refine_bn_mean = pretrained_refine[1].running_mean
+        refine_bn_var = pretrained_refine[1].running_var
+        
+        # With unified architectures, refine input channels should match - warn if they don't
+        refine_in_ch_required = spiking_dec.refine.conv.in_channels
+        if refine_weight.shape[1] != refine_in_ch_required:
+            raise RuntimeError(
+                f"[convert_pretrained_to_spiking] Architecture mismatch in decoder {i} refine: "
+                f"pretrained has {refine_weight.shape[1]} input channels, "
+                f"spiking model expects {refine_in_ch_required}. "
+                f"Architectures must match exactly - check skip_merge config."
+            )
+        
+        # Transfer refine to spiking layer
+        spiking_dec.refine.conv.weight.data = refine_weight.clone()
+        if refine_bias is not None:
+            spiking_dec.refine.conv.bias.data = refine_bias.clone()
+        
+        spiking_dec.refine.bn.weight.data = refine_bn_weight.clone()
+        spiking_dec.refine.bn.bias.data = refine_bn_bias.clone()
+        spiking_dec.refine.bn.running_mean = refine_bn_mean.clone()
+        spiking_dec.refine.bn.running_var = refine_bn_var.clone()
     
     # Transfer output weights
     spiking_model.output_projection.conv.weight.data = pretrained_model.output.weight.data.clone()
