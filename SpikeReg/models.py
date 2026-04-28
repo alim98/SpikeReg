@@ -111,6 +111,9 @@ class SpikeRegUNet(nn.Module):
         # Input spike encoding parameters
         self.register_buffer('spike_encoding_window', torch.tensor(config.get('input_time_window', 10)))
         self._spike_rate_checked = False
+        # Poisson encoding is only used at inference time on neuromorphic hardware.
+        # During GPU training, continuous values are injected directly so gradients flow cleanly.
+        self.use_poisson_encoding = config.get('use_poisson_encoding', False)
     
     def encode_to_spikes(self, x: torch.Tensor, time_window: int = 10) -> torch.Tensor:
         """
@@ -172,21 +175,17 @@ class SpikeRegUNet(nn.Module):
         """
         # Concatenate fixed and moving images
         x = torch.cat([fixed, moving], dim=1)  # [B, 2, D, H, W]
-        
-        # Debug removed - was causing log spam
-        # x_min = x.min().item()
-        # x_max = x.max().item()
-        # print(f"[SpikeRegUNet DEBUG] Input range: min={x_min}, max={x_max}")
 
-        # Encode to spikes
-        spike_input = self.encode_to_spikes(x, self.spike_encoding_window.item())
-
-        # check for NaN
-        if torch.isnan(spike_input).any():
-            print("Warning: NaN detected in spike input tensor!")
-
-        # For first encoder, average spikes over time as input
-        x_rates = spike_input.mean(dim=1)
+        # During training: feed continuous values directly into the network.
+        # This preserves gradient flow through LIF surrogate gradients.
+        # Poisson encoding is only used on neuromorphic hardware at inference time.
+        if self.use_poisson_encoding and not self.training:
+            spike_input = self.encode_to_spikes(x, int(self.spike_encoding_window.item()))
+            if torch.isnan(spike_input).any():
+                print("Warning: NaN detected in spike input tensor!")
+            x_rates = spike_input.mean(dim=1)
+        else:
+            x_rates = torch.clamp(x, 0.0, 1.0)  # direct continuous input [B, 2, D, H, W]
         
         # Encoder path
         encoder_features = []
@@ -405,10 +404,128 @@ class PretrainedUNet(nn.Module):
         return displacement
 
 
+def calibrate_thresholds(
+    pretrained_model: 'PretrainedUNet',
+    calibration_loader,
+    percentile: float = 99.5,
+    device: torch.device = None,
+) -> Dict[str, float]:
+    """
+    Run calibration batches through the ANN and record per-layer activation
+    statistics.  Returns a dict mapping a layer key to a threshold value.
+
+    The keys follow the pattern used in _apply_calibrated_thresholds():
+        "encoder_{i}", "decoder_up_{i}", "decoder_refine_{i}"
+
+    Reference: Diehl et al. (2015), Rueckauer et al. (2017)
+    """
+    if device is None:
+        device = next(pretrained_model.parameters()).device
+
+    pretrained_model.eval()
+    activation_stats: Dict[str, list] = {}
+    hooks = []
+
+    # --- register hooks on BN layers (post-BN activations before ReLU) ---
+    # Encoder: encoders[i] = Sequential(Conv, BN, ReLU, Conv, BN, ReLU)
+    # We hook the BN at index 1 (first conv block) for each encoder level.
+    for i, enc in enumerate(pretrained_model.encoders):
+        key = f"encoder_{i}"
+        # BN is at index 1 in the sequential (Conv, BN, ReLU, Conv, BN, ReLU)
+        bn = enc[1]
+        def make_hook(k):
+            def fn(module, inp, out):
+                activation_stats.setdefault(k, []).append(
+                    out.detach().cpu().float().clamp(min=0)
+                )
+            return fn
+        hooks.append(bn.register_forward_hook(make_hook(key)))
+
+    # Decoder upconv BN (index 1 in ConvTranspose3d, BN, ReLU sequential)
+    for i, dec in enumerate(pretrained_model.decoders):
+        key = f"decoder_up_{i}"
+        bn = dec[1]
+        def make_hook(k):
+            def fn(module, inp, out):
+                activation_stats.setdefault(k, []).append(
+                    out.detach().cpu().float().clamp(min=0)
+                )
+            return fn
+        hooks.append(bn.register_forward_hook(make_hook(key)))
+
+    # Decoder refine BN (index 1 in Conv, BN, ReLU sequential)
+    for i, ref in enumerate(pretrained_model.decoder_refines):
+        key = f"decoder_refine_{i}"
+        bn = ref[1]
+        def make_hook(k):
+            def fn(module, inp, out):
+                activation_stats.setdefault(k, []).append(
+                    out.detach().cpu().float().clamp(min=0)
+                )
+            return fn
+        hooks.append(bn.register_forward_hook(make_hook(key)))
+
+    with torch.no_grad():
+        for batch in calibration_loader:
+            fixed = batch['fixed'].to(device)
+            moving = batch['moving'].to(device)
+            pretrained_model(fixed, moving)
+
+    thresholds: Dict[str, float] = {}
+    for key, acts_list in activation_stats.items():
+        all_acts = torch.cat([a.flatten() for a in acts_list])
+        positive = all_acts[all_acts > 0]
+        if positive.numel() > 0:
+            thresholds[key] = torch.quantile(positive, percentile / 100.0).item()
+        else:
+            thresholds[key] = 1.0
+
+    for h in hooks:
+        h.remove()
+
+    print(f"[calibrate_thresholds] Calibrated {len(thresholds)} layers. "
+          f"Range: [{min(thresholds.values()):.4f}, {max(thresholds.values()):.4f}]")
+    return thresholds
+
+
+def _apply_calibrated_thresholds(
+    spiking_model: 'SpikeRegUNet',
+    thresholds: Dict[str, float],
+) -> None:
+    """Apply per-layer calibrated thresholds to LIF neurons in the spiking model."""
+    for i, enc_block in enumerate(spiking_model.encoder_blocks):
+        key = f"encoder_{i}"
+        if key in thresholds:
+            th = thresholds[key]
+            with torch.no_grad():
+                enc_block.conv.neurons.v_th.fill_(th)
+
+    for i, dec_block in enumerate(spiking_model.decoder_blocks):
+        key_up = f"decoder_up_{i}"
+        if key_up in thresholds:
+            th = thresholds[key_up]
+            with torch.no_grad():
+                dec_block.upconv.neurons.v_th.fill_(th)
+
+        key_ref = f"decoder_refine_{i}"
+        if key_ref in thresholds:
+            th = thresholds[key_ref]
+            with torch.no_grad():
+                dec_block.refine.neurons.v_th.fill_(th)
+
+    if hasattr(spiking_model, 'bottleneck'):
+        # Use mean of encoder thresholds for bottleneck
+        enc_vals = [v for k, v in thresholds.items() if k.startswith('encoder_')]
+        if enc_vals:
+            with torch.no_grad():
+                spiking_model.bottleneck.neurons.v_th.fill_(sum(enc_vals) / len(enc_vals))
+
+
 def convert_pretrained_to_spiking(
     pretrained_model: PretrainedUNet,
     config: Dict,
-    threshold_percentile: float = 99.0
+    threshold_percentile: float = 99.0,
+    calibration_loader=None,
 ) -> SpikeRegUNet:
     """
     Convert a pretrained U-Net to SpikeReg U-Net
@@ -528,8 +645,21 @@ def convert_pretrained_to_spiking(
     spiking_model.output_projection.conv.weight.data = pretrained_model.output.weight.data.clone()
     if pretrained_model.output.bias is not None:
         spiking_model.output_projection.conv.bias.data = pretrained_model.output.bias.data.clone()
-    
-    # Normalize thresholds based on activation statistics
-    # (This would require running calibration data through the network)
-    
-    return spiking_model 
+
+    # Threshold calibration: run calibration data through the ANN and set
+    # each LIF neuron's v_th to the layer-wise activation percentile.
+    if calibration_loader is not None:
+        device = next(pretrained_model.parameters()).device
+        thresholds = calibrate_thresholds(
+            pretrained_model,
+            calibration_loader,
+            percentile=threshold_percentile,
+            device=device,
+        )
+        _apply_calibrated_thresholds(spiking_model, thresholds)
+    else:
+        print("[convert_pretrained_to_spiking] No calibration_loader provided; "
+              "using default v_th=1.0 for all LIF neurons. "
+              "For best results pass a calibration_loader.")
+
+    return spiking_model

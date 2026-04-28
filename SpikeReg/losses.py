@@ -337,6 +337,44 @@ class SpikingRegularizer(nn.Module):
         return spike_loss + balance_loss
 
 
+class PretrainLoss(nn.Module):
+    """
+    Loss for ANN pretraining phase: NCC + diffusion regularization.
+
+    Same (fixed, moving, displacement, warped, spike_counts) call signature
+    as SpikeRegLoss so the training loop needs no branching.
+    """
+
+    def __init__(
+        self,
+        similarity_weight: float = 1.0,
+        regularization_weight: float = 1.0,
+        ncc_window_size: int = 9,
+    ):
+        super().__init__()
+        self.similarity_loss = NormalizedCrossCorrelation(window_size=ncc_window_size)
+        self.regularization_loss = DiffusionRegularizer(weight=regularization_weight)
+        self.similarity_weight = similarity_weight
+
+    def forward(
+        self,
+        fixed: torch.Tensor,
+        moving: torch.Tensor,
+        displacement: torch.Tensor,
+        warped: torch.Tensor,
+        spike_counts: Dict,
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        sim_loss = self.similarity_loss(fixed, warped)
+        reg_loss = self.regularization_loss(displacement)
+        total = self.similarity_weight * sim_loss + reg_loss
+        loss_components = {
+            'similarity': sim_loss,
+            'regularization': reg_loss,
+            'total': total,
+        }
+        return total, loss_components
+
+
 class SpikeRegLoss(nn.Module):
     """
     Combined loss function for SpikeReg training

@@ -5,7 +5,7 @@ Evaluation metrics for SpikeReg
 import torch
 import torch.nn.functional as F
 import numpy as np
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 
 def normalized_cross_correlation(
@@ -330,6 +330,74 @@ def structural_similarity_index(
     ssim = ssim_map.view(img1.shape[0], -1).mean(dim=1)
     
     return ssim
+
+
+def compute_energy_estimate(
+    spike_rates: Dict[str, float],
+    volume_shape: Tuple[int, int, int] = (128, 128, 128),
+    encoder_channels: Optional[List[int]] = None,
+    decoder_channels: Optional[List[int]] = None,
+    time_steps: int = 4,
+    E_AC_pJ: float = 0.9,
+    E_MAC_pJ: float = 4.6,
+) -> Dict[str, float]:
+    """
+    Analytical energy estimate for SNN vs equivalent ANN.
+
+    Uses operation-count model from:
+      Horowitz, "Computing's Energy Problem," ISSCC 2014.
+
+    E_SNN  = sum_layers(spike_rate * n_neurons * n_synapses * E_AC)
+    E_ANN  = sum_layers(n_neurons * n_synapses * E_MAC)
+    ratio  = E_SNN / E_ANN = avg_spike_rate * (E_AC / E_MAC)
+
+    With avg_spike_rate=0.10 and the default constants this gives ~50× reduction.
+    """
+    if encoder_channels is None:
+        encoder_channels = [16, 32, 64, 128]
+    if decoder_channels is None:
+        decoder_channels = [64, 32, 16, 16]
+
+    mean_spike_rate = (
+        sum(spike_rates.values()) / len(spike_rates) if spike_rates else 0.1
+    )
+
+    # energy ratio (dimensionless)
+    energy_ratio = mean_spike_rate * (E_AC_pJ / E_MAC_pJ)
+    reduction_factor = 1.0 / energy_ratio if energy_ratio > 0 else float("inf")
+
+    # approximate MAC counts for the ANN (conv3d: in_ch * out_ch * k^3 * spatial)
+    D, H, W = volume_shape
+    k = 3  # kernel size
+    ann_macs = 0.0
+    spatial = D * H * W
+    in_ch = 2  # fixed + moving
+    for out_ch in encoder_channels:
+        ann_macs += in_ch * out_ch * (k ** 3) * spatial
+        in_ch = out_ch
+        spatial //= 8  # stride-2 halves each dim
+
+    spatial = (D // (2 ** len(encoder_channels))) * (H // (2 ** len(encoder_channels))) * (W // (2 ** len(encoder_channels)))
+    for out_ch in decoder_channels:
+        ann_macs += in_ch * out_ch * (k ** 3) * spatial
+        in_ch = out_ch
+        spatial *= 8
+
+    snn_acs = ann_macs * mean_spike_rate * time_steps
+    E_ANN_mJ = ann_macs * E_MAC_pJ * 1e-9   # pJ → mJ
+    E_SNN_mJ = snn_acs * E_AC_pJ * 1e-9
+
+    return {
+        "mean_spike_rate": mean_spike_rate,
+        "energy_ratio_snn_over_ann": energy_ratio,
+        "energy_reduction_factor": reduction_factor,
+        "E_ANN_mJ": E_ANN_mJ,
+        "E_SNN_mJ": E_SNN_mJ,
+        "ann_macs_G": ann_macs / 1e9,
+        "snn_acs_G": snn_acs / 1e9,
+        "E_AC_pJ": E_AC_pJ,
+        "E_MAC_pJ": E_MAC_pJ,
+    }
 
 
 def compute_registration_metrics(

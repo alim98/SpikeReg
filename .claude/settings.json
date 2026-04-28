@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(python -c ' *)",
+      "Bash(python3 -c \"import torch; print\\(torch.__version__\\)\")",
+      "Bash(conda info *)",
+      "Read(//u/almik/miniconda3/**)",
+      "Read(//u/almik/.conda/**)"
+    ]
+  }
+}

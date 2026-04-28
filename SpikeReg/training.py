@@ -16,9 +16,9 @@ import yaml
 import json
 from contextlib import redirect_stdout
 
-from .models import SpikeRegUNet, PretrainedUNet, convert_pretrained_to_spiking
+from .models import SpikeRegUNet, PretrainedUNet, convert_pretrained_to_spiking, calibrate_thresholds
 from .registration import IterativeRegistration
-from .losses import SpikeRegLoss
+from .losses import SpikeRegLoss, PretrainLoss
 from .utils.warping import SpatialTransformer
 from .utils.metrics import dice_score, jacobian_determinant_stats
 
@@ -261,17 +261,6 @@ class SpikeRegTrainer:
             # Wrap for multi-GPU if enabled
             self.spiking_model = self._wrap_model_for_multi_gpu(self.spiking_model)
             self.current_model = self.spiking_model
-            
-            # Create iterative registration wrapper
-            base_spiking_model = self.spiking_model
-            if hasattr(self.spiking_model, 'module'):
-                base_spiking_model = self.spiking_model.module
-            
-            self.registration = IterativeRegistration(
-                base_spiking_model,
-                num_iterations=self.config['training'].get('num_iterations', 10),
-                early_stop_threshold=self.config['training'].get('early_stop_threshold', 0.001)
-            )
             with open(self.log_file, 'a') as f:
                 f.write(f"Initialized spiking model: {self.spiking_model.__class__.__name__}\n")
     
@@ -282,23 +271,12 @@ class SpikeRegTrainer:
             self.spiking_model = SpikeRegUNet(self.config['model']).to(self.device)
             self.spiking_model = self._wrap_model_for_multi_gpu(self.spiking_model)
             self.current_model = self.spiking_model
-            
-            from .registration import IterativeRegistration
-            base_spiking_model = self.spiking_model
-            if hasattr(self.spiking_model, 'module'):
-                base_spiking_model = self.spiking_model.module
-            
-            self.registration = IterativeRegistration(
-                base_spiking_model,
-                num_iterations=self.config['training'].get('num_iterations', 10),
-                early_stop_threshold=self.config['training'].get('early_stop_threshold', 0.001)
-            )
-            
+
             self.training_phase = 'finetune'
             self._update_aim_tags()
             self._init_optimizer()
             self._init_loss()
-            
+
             with open(self.log_file, 'a') as f:
                 f.write(f"Initialized spiking model for checkpoint loading: {self.spiking_model.__class__.__name__}\n")
     
@@ -352,12 +330,16 @@ class SpikeRegTrainer:
     def _init_loss(self):
         """Initialize loss function"""
         loss_config = self.config['training']['loss']
-        
+
         if self.training_phase == 'pretrain':
-            # Simple loss for pretraining
-            self.criterion = nn.MSELoss()
+            # NCC + diffusion regularization for pretraining (not MSE)
+            self.criterion = PretrainLoss(
+                similarity_weight=loss_config.get('similarity_weight', 1.0),
+                regularization_weight=loss_config.get('regularization_weight', 1.0),
+                ncc_window_size=loss_config.get('ncc_win', 9),
+            )
             with open(self.log_file, 'a') as f:
-                f.write("Using MSE loss for pretrained model\n")
+                f.write("Using NCC + DiffusionReg (PretrainLoss) for pretrained model\n")
         else:
             # Full SpikeReg loss
             self.criterion = SpikeRegLoss(
@@ -428,44 +410,35 @@ class SpikeRegTrainer:
                     
                     # Forward pass
                     if self.training_phase == 'pretrain':
-                        # Pretrained model - direct prediction
+                        # Pretrained ANN model - single-pass prediction
                         displacement = self.current_model(fixed, moving)
                         warped = self.spatial_transformer(moving, displacement)
-                        
-                        # Simple MSE loss
-                        loss = self.criterion(warped, fixed)
-                        # Log per-component even in pretrain phase
-                        loss_value = float(loss.item())
-                        loss_dict = {
-                            'mse': loss_value,
-                            'total': loss_value,
-                        }
                         spike_counts = {}
-                        
+
+                        # NCC + diffusion regularization loss
+                        loss, loss_dict = self.criterion(fixed, moving, displacement, warped, spike_counts)
+                        for k, v in loss_dict.items():
+                            if torch.is_tensor(v):
+                                loss_dict[k] = v.item()
+
                     else:
-                        # Spiking model - iterative registration
-                        if self.registration is None:
-                            raise RuntimeError("Registration not initialized for finetune phase")
-                        output = self.registration(fixed, moving, return_all_iterations=False)
+                        # Spiking model - single-pass prediction (no iterative loop during training)
+                        output = self.current_model(fixed, moving)
                         displacement = output['displacement']
-                        warped = output['warped']
-                        if 'spike_count_history' in output:
-                            spike_counts = output['spike_count_history'][-1] if output['spike_count_history'] else {}
-                        else:
-                            spike_counts = output.get('spike_counts', {})
-                        
+                        warped = self.spatial_transformer(moving, displacement)
+                        spike_counts = output.get('spike_counts', {})
+
+                        if torch.isnan(displacement).any() or torch.isnan(warped).any():
+                            with open(self.log_file, 'a') as f:
+                                f.write(f"Warning: Batch {batch_idx} has NaN in displacement or warped\n")
+
                         # Full loss computation
                         loss, loss_dict = self.criterion(
                             fixed, moving, displacement, warped, spike_counts
                         )
-                        # Ensure loss_dict values are plain Python floats for safe logging / NumPy ops
                         for k, v in loss_dict.items():
                             if torch.is_tensor(v):
                                 loss_dict[k] = v.item()
-                        # Log only critical warnings (NaN detection) - removed heavy per-batch logging
-                        if 'hasNaN' in output and output['hasNaN']:
-                            with open(self.log_file, 'a') as f:
-                                f.write(f"Warning: Batch {batch_idx} has NaN in displacement or warped\n")
                                     
                     # Backward pass
                     loss.backward()
@@ -537,33 +510,33 @@ class SpikeRegTrainer:
             if self.training_phase == 'pretrain':
                 displacement = self.current_model(fixed, moving)
                 warped = self.spatial_transformer(moving, displacement)
-                loss = self.criterion(warped, fixed)
-                loss_value = float(loss.item())
-                val_losses.append(loss_value)
-                val_loss_dict = {'mse': loss_value, 'total': loss_value}
+                spike_counts_val = {}
+
+                loss, val_loss_dict = self.criterion(fixed, moving, displacement, warped, spike_counts_val)
+                val_losses.append(float(loss.item()))
+
                 for comp_name, comp_value in val_loss_dict.items():
-                    val_loss_component_sums[comp_name] = val_loss_component_sums.get(comp_name, 0.0) + float(comp_value)
+                    val_loss_component_sums[comp_name] = val_loss_component_sums.get(comp_name, 0.0) + float(comp_value.item() if torch.is_tensor(comp_value) else comp_value)
                 val_loss_component_count += 1
             else:
-                if self.registration is None:
-                    raise RuntimeError("Registration not initialized for finetune phase")
-                output = self.registration(fixed, moving, return_all_iterations=False)
+                # Single-pass prediction (no iterative loop during validation)
+                output = self.current_model(fixed, moving)
                 displacement = output['displacement']
-                warped = output['warped']
+                warped = self.spatial_transformer(moving, displacement)
+                spike_counts_val = output.get('spike_counts', {})
+
+                if torch.isnan(displacement).any() or torch.isnan(warped).any():
+                    with open(self.log_file, 'a') as f:
+                        f.write("Warning: Has NaN in displacement or warped\n")
 
                 loss, val_loss_dict = self.criterion(
-                    fixed, moving, displacement, warped,
-                    output.get('spike_counts', {})
+                    fixed, moving, displacement, warped, spike_counts_val
                 )
                 val_losses.append(float(loss.item()))
 
                 for comp_name, comp_value in val_loss_dict.items():
                     val_loss_component_sums[comp_name] = val_loss_component_sums.get(comp_name, 0.0) + float(comp_value.item() if torch.is_tensor(comp_value) else comp_value)
                 val_loss_component_count += 1
-
-                if output.get('hasNaN', False):
-                    with open(self.log_file, 'a') as f:
-                        f.write("Warning: Has NaN in displacement or warped\n")
 
             if 'segmentation_fixed' in batch and 'segmentation_moving' in batch:
                 seg_fixed = batch['segmentation_fixed'].to(self.device)
@@ -653,59 +626,48 @@ class SpikeRegTrainer:
                         f"Val Loss: {val_metrics['val_loss']:.4f}, "
                         f"Val Dice: {val_metrics['val_dice']:.4f}\n")
         
-    def convert_to_spiking(self):
-        """Convert pretrained model to spiking"""
+    def convert_to_spiking(self, calibration_loader=None):
+        """Convert pretrained model to spiking with optional threshold calibration"""
         if self.pretrained_model is None:
             raise ValueError("No pretrained model to convert")
-        
+
         print("Converting pretrained model to spiking...")
         with open(self.log_file, 'a') as f:
             f.write("Converting pretrained model to spiking...\n")
-        
+
         # Switch to finetune phase
         self.training_phase = 'finetune'
         self._update_aim_tags()
-        
+
         # Get the underlying model if wrapped with DataParallel
         base_model = self.pretrained_model
         if hasattr(self.pretrained_model, 'module'):
             base_model = self.pretrained_model.module
-        
-        # Convert model
+
+        # Convert model with optional calibration
         self.spiking_model = convert_pretrained_to_spiking(
             base_model,
             self.config['model'],
-            threshold_percentile=self.config['conversion'].get('threshold_percentile', 99.0)
+            threshold_percentile=self.config['conversion'].get('threshold_percentile', 99.0),
+            calibration_loader=calibration_loader,
         ).to(self.device)
-        
+
         # Wrap for multi-GPU if enabled
         self.spiking_model = self._wrap_model_for_multi_gpu(self.spiking_model)
-        
+
         # Update current model
         self.current_model = self.spiking_model
-        
+
         # Reinitialize optimizer and loss for spiking model
         self._init_optimizer()
         self._init_loss()
-        
-        # Create registration wrapper (using base model for registration)
-        base_spiking_model = self.spiking_model
-        if hasattr(self.spiking_model, 'module'):
-            base_spiking_model = self.spiking_model.module
-        
-        self.registration = IterativeRegistration(
-            base_spiking_model,
-            num_iterations=self.config['training'].get('num_iterations', 10),
-            early_stop_threshold=self.config['training'].get('early_stop_threshold', 0.001)
-        )
 
         self._freeze_batch_norm()
 
         with open(self.log_file, 'a') as f:
             f.write(f"Converted to spiking model: {self.spiking_model.__class__.__name__}\n")
-        with open(self.log_file, 'a') as f:
             f.write(f"Spiking model config: {json.dumps(self.config['model'], indent=2)}\n")
-        
+
         print("Conversion complete!")
     
     def save_checkpoint(self, filename: str):
@@ -927,39 +889,49 @@ def save_config(config: Dict, path: str):
 
 
 def _create_loaders_from_config(config: Dict) -> Tuple[DataLoader, DataLoader]:
-    from examples.oasis_dataset import create_oasis_loaders
-
     data_cfg = config.get('data', {})
     train_dir = data_cfg.get('train_dir')
-    val_dir = data_cfg.get('val_dir', train_dir)
-    batch_size = int(config.get('training', {}).get('batch_size', 2))
-    patch_size = int(data_cfg.get('patch_size', config.get('model', {}).get('patch_size', 32)))
-    patch_stride = int(data_cfg.get('patch_stride', 16))
+    batch_size = int(config.get('training', {}).get('batch_size', 1))
     num_workers = int(config.get('training', {}).get('num_workers', 4))
-
-    if train_dir.endswith('/L2R_2021_Task3_train'):
-        data_root = train_dir[:-len('/L2R_2021_Task3_train')]
-    else:
-        data_root = train_dir
-
     train_cfg = config.get('training', {})
     pin_memory = train_cfg.get('pin_memory', True)
 
-    train_loader, val_loader = create_oasis_loaders(
-        data_root,
-        batch_size=batch_size,
-        patch_size=patch_size,
-        patch_stride=patch_stride,
-        patches_per_pair=int(config.get('data', {}).get('patches_per_pair', 20)),
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-    )
+    use_full_volume = data_cfg.get('full_volume', False)
+
+    if use_full_volume:
+        from examples.oasis_dataset import create_oasis_full_volume_loaders
+        resample = data_cfg.get('resample_size', [160, 192, 224])
+        target_shape = tuple(int(x) for x in resample)
+        num_steps = int(data_cfg.get('num_steps', 1000))
+        train_loader, val_loader = create_oasis_full_volume_loaders(
+            train_dir,
+            batch_size=batch_size,
+            target_shape=target_shape,
+            num_steps=num_steps,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=int(train_cfg.get('prefetch_factor', 2)) if num_workers > 0 else None,
+        )
+    else:
+        from examples.oasis_dataset import create_oasis_loaders
+        # Patch-based mode: expects data_root with L2R_2021_Task3_train/ subdir
+        data_root = str(Path(train_dir).parent) if train_dir.endswith('/L2R_2021_Task3_train') else train_dir
+        patch_size = int(data_cfg.get('patch_size', 32))
+        patch_stride = int(data_cfg.get('patch_stride', 16))
+        train_loader, val_loader = create_oasis_loaders(
+            data_root,
+            batch_size=batch_size,
+            patch_size=patch_size,
+            patch_stride=patch_stride,
+            patches_per_pair=int(data_cfg.get('patches_per_pair', 20)),
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+        )
 
     debug_percent = data_cfg.get('debug_percent')
     if debug_percent is not None:
         debug_percent = float(debug_percent)
-        if debug_percent > 0:
-            debug_percent = min(debug_percent, 100.0)
+        if 0 < debug_percent < 100.0:
             n_train = max(1, int(len(train_loader.dataset) * debug_percent / 100.0))
             n_val = max(1, int(len(val_loader.dataset) * debug_percent / 100.0))
 
@@ -974,7 +946,6 @@ def _create_loaders_from_config(config: Dict) -> Tuple[DataLoader, DataLoader]:
                 shuffle=True,
                 **loader_kwargs,
             )
-
             val_loader = DataLoader(
                 Subset(val_loader.dataset, list(range(n_val))),
                 shuffle=False,
@@ -1065,7 +1036,7 @@ def main_cli():
                 
                 if not converted_complete:
                     print("Converting pretrained model to spiking...")
-                    trainer.convert_to_spiking()
+                    trainer.convert_to_spiking(calibration_loader=val_loader)
                     trainer.epoch = -1
                     trainer.save_checkpoint('converted_model.pth')
                 else:
@@ -1094,7 +1065,7 @@ def main_cli():
                     
                     if architecture_mismatch:
                         print("Converted checkpoint has old architecture. Re-converting from pretrained model...")
-                        trainer.convert_to_spiking()
+                        trainer.convert_to_spiking(calibration_loader=val_loader)
                         trainer.epoch = -1
                         trainer.save_checkpoint('converted_model.pth')
                     else:
@@ -1106,7 +1077,7 @@ def main_cli():
                     print(f"Resuming pretrain from epoch {trainer.epoch}, continuing to epoch {pretrain_epochs}")
                 trainer.train(train_loader, val_loader, num_epochs=pretrain_epochs)
                 trainer.save_checkpoint('pretrained_model.pth')
-                trainer.convert_to_spiking()
+                trainer.convert_to_spiking(calibration_loader=val_loader)
                 trainer.epoch = -1
                 trainer.save_checkpoint('converted_model.pth')
 
@@ -1142,7 +1113,7 @@ def main_cli():
                         print("Converted checkpoint has old architecture. Re-converting from pretrained model...")
                         if pretrain_complete:
                             trainer.load_checkpoint('pretrained_model.pth')
-                            trainer.convert_to_spiking()
+                            trainer.convert_to_spiking(calibration_loader=val_loader)
                             trainer.epoch = -1
                             trainer.save_checkpoint('converted_model.pth')
                         else:
@@ -1153,7 +1124,7 @@ def main_cli():
                 elif pretrain_complete:
                     print(f"Loading pretrained model and converting: {pretrained_model_path}")
                     trainer.load_checkpoint('pretrained_model.pth')
-                    trainer.convert_to_spiking()
+                    trainer.convert_to_spiking(calibration_loader=val_loader)
                     trainer.epoch = -1
                     trainer.save_checkpoint('converted_model.pth')
                 else:
