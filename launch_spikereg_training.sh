@@ -7,11 +7,11 @@ REPO_ROOT="$SCRIPT_DIR"
 
 JOB_SCRIPT="${JOB_SCRIPT:-$SCRIPT_DIR/train_spikereg.sh}"
 RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/checkpoints/spikereg/runs}"
-CONFIG_DEFAULT="${CONFIG_DEFAULT:-$REPO_ROOT/configs/spikereg_oasis_new_config.yaml}"
+CONFIG_DEFAULT="${CONFIG_DEFAULT:-$REPO_ROOT/configs/spikereg_l2r_config.yaml}"
 
 RUN_TAG="${RUN_TAG:-$(date +"%Y%m%d-%H%M%S")}"
 GROUP_DIR="${RUN_ROOT}/${RUN_TAG}"
-mkdir -p "$GROUP_DIR"
+mkdir -p "$GROUP_DIR" "$REPO_ROOT/slurm/output_spikereg" "$REPO_ROOT/slurm/error_spikereg"
 ln -sfn "$GROUP_DIR" "${RUN_ROOT}/latest_group"
 
 START_FROM=""
@@ -33,37 +33,43 @@ latest_ckpt_in() {
       return
     fi
     
-    # Priority order per user specification:
-    # 1. pretrain_epoch_n.pth (latest pretrain epoch)
-    # 2. pretrain_best_model.pth
-    # 3. converted_model.pth
-    # 4. finetune_epoch_n.pth (latest finetune epoch)
-    
-    # 1. Check for pretrain checkpoints (latest epoch)
+    # Resume the most advanced phase first.
+    if [[ -f "$ckpt_dir/final_model.pth" ]]; then
+      echo "$ckpt_dir/final_model.pth"
+      return
+    fi
+
+    local finetune_ckpt
+    finetune_ckpt=$(find "$ckpt_dir" -name 'finetune_epoch_*.pth' 2>/dev/null | sort -V | tail -n1)
+    if [[ -n "$finetune_ckpt" ]]; then
+      echo "$finetune_ckpt"
+      return
+    fi
+
+    if [[ -f "$ckpt_dir/finetune_best_model.pth" ]]; then
+      echo "$ckpt_dir/finetune_best_model.pth"
+      return
+    fi
+
+    if [[ -f "$ckpt_dir/converted_model.pth" ]]; then
+      echo "$ckpt_dir/converted_model.pth"
+      return
+    fi
+
+    if [[ -f "$ckpt_dir/pretrained_model.pth" ]]; then
+      echo "$ckpt_dir/pretrained_model.pth"
+      return
+    fi
+
     local pretrain_ckpt
     pretrain_ckpt=$(find "$ckpt_dir" -name 'pretrain_epoch_*.pth' 2>/dev/null | sort -V | tail -n1)
     if [[ -n "$pretrain_ckpt" ]]; then
       echo "$pretrain_ckpt"
       return
     fi
-    
-    # 2. Check for pretrain_best_model.pth
+
     if [[ -f "$ckpt_dir/pretrain_best_model.pth" ]]; then
       echo "$ckpt_dir/pretrain_best_model.pth"
-      return
-    fi
-    
-    # 3. Check for converted model
-    if [[ -f "$ckpt_dir/converted_model.pth" ]]; then
-      echo "$ckpt_dir/converted_model.pth"
-      return
-    fi
-    
-    # 4. Check for finetune checkpoints (latest epoch)
-    local finetune_ckpt
-    finetune_ckpt=$(find "$ckpt_dir" -name 'finetune_epoch_*.pth' 2>/dev/null | sort -V | tail -n1)
-    if [[ -n "$finetune_ckpt" ]]; then
-      echo "$finetune_ckpt"
       return
     fi
     
@@ -112,16 +118,22 @@ find_latest_checkpoint_recursive() {
     local epoch=-1
     
     # Determine priority and epoch (lower priority number = higher priority)
-    if [[ "$ckpt_path" == *"pretrain_epoch_"* ]]; then
+    if [[ "$ckpt_path" == *"final_model.pth" ]]; then
       priority=1
+    elif [[ "$ckpt_path" == *"finetune_epoch_"* ]]; then
+      priority=2
+      epoch=$(echo "$ckpt_path" | sed -E 's/.*finetune_epoch_([0-9]+)\.pth/\1/')
+    elif [[ "$ckpt_path" == *"finetune_best_model.pth" ]]; then
+      priority=3
+    elif [[ "$ckpt_path" == *"converted_model.pth" ]]; then
+      priority=4
+    elif [[ "$ckpt_path" == *"pretrained_model.pth" ]]; then
+      priority=5
+    elif [[ "$ckpt_path" == *"pretrain_epoch_"* ]]; then
+      priority=6
       epoch=$(echo "$ckpt_path" | sed -E 's/.*pretrain_epoch_([0-9]+)\.pth/\1/')
     elif [[ "$ckpt_path" == *"pretrain_best_model.pth" ]]; then
-      priority=2
-    elif [[ "$ckpt_path" == *"converted_model.pth" ]]; then
-      priority=3
-    elif [[ "$ckpt_path" == *"finetune_epoch_"* ]]; then
-      priority=4
-      epoch=$(echo "$ckpt_path" | sed -E 's/.*finetune_epoch_([0-9]+)\.pth/\1/')
+      priority=7
     else
       continue
     fi
@@ -133,7 +145,7 @@ find_latest_checkpoint_recursive() {
       best_priority=$priority
       best_epoch=$epoch
     fi
-  done < <(find "$search_root" -type f \( -name "finetune_epoch_*.pth" -o -name "converted_model.pth" -o -name "pretrain_best_model.pth" -o -name "pretrain_epoch_*.pth" \) 2>/dev/null)
+  done < <(find "$search_root" -type f \( -name "final_model.pth" -o -name "finetune_epoch_*.pth" -o -name "finetune_best_model.pth" -o -name "converted_model.pth" -o -name "pretrained_model.pth" -o -name "pretrain_best_model.pth" -o -name "pretrain_epoch_*.pth" \) 2>/dev/null)
   
   echo "$best_ckpt"
 }
@@ -196,7 +208,7 @@ while true; do
       fi
     elif [[ -n "$ckpt_path" ]]; then
       # Extract epoch from checkpoint
-      checkpoint_epoch=$(echo "$ckpt_path" | sed 's/.*model_epoch_\([0-9]\+\)\.pth/\1/')
+      checkpoint_epoch=$(echo "$ckpt_path" | sed -nE 's/.*pretrain_epoch_([0-9]+)\.pth/\1/p')
       
       # Read pretrain epochs from config
       pretrain_epochs=$(grep -E '^\s*pretrain_epochs:' "$CONFIG" | sed 's/.*:\s*\([0-9]\+\).*/\1/' || echo "0")

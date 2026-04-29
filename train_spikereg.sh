@@ -4,14 +4,17 @@
 #SBATCH -o ./slurm/output_spikereg/%j.out
 #SBATCH -e ./slurm/error_spikereg/%j.err
 #SBATCH -J spikereg_training
-#SBATCH --nodes=1
-#SBATCH --ntasks-per-node=4           # # of processes (DDP)
+#SBATCH --nodes=2
+#SBATCH --ntasks=8
+#SBATCH --ntasks-per-node=4           # one Python/DDP rank per GPU
+#SBATCH -A mhf_gpu
+#SBATCH --qos=g0008
 #SBATCH --cpus-per-task=16
-#SBATCH --mem=128000
+#SBATCH --mem=125G
 #SBATCH --constraint=gpu
 #SBATCH --gres=gpu:a100:4
 #SBATCH --mail-type=NONE
-#SBATCH --time=5:00:00
+#SBATCH --time=23:00:00
 
 set -euo pipefail
 
@@ -24,16 +27,19 @@ module load openmpi_gpu/4.1
 
 # Activate the conda environment
 source /mpcdf/soft/SLE_15/packages/x86_64/anaconda/3/2023.03/etc/profile.d/conda.sh
-conda activate cephclr
+conda activate "${SPIKEREG_ENV:-cephclr}"
 
 # Load PyTorch distributed module (must load after anaconda module is loaded)
 module load pytorch-distributed/gpu-cuda-11.6/2.1.0
 
 # --- Python & performance knobs ---
 export OMP_NUM_THREADS="${OMP_NUM_THREADS:-8}"
-export TORCH_DISTRIBUTED_DEBUG=DETAIL
+export TORCH_DISTRIBUTED_DEBUG="${TORCH_DISTRIBUTED_DEBUG:-OFF}"
 export NCCL_DEBUG=WARN
 export PYTHON=${PYTHON_PATH:-$(which python)}
+export PYTHONUNBUFFERED=1
+export PYTHONDONTWRITEBYTECODE=1
+export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 # --- Args from sbatch line ---
 CONFIG=""
@@ -85,8 +91,12 @@ fi
 #   python SpikeReg/training.py --config ... [--resume path]
 # --- Run as a MODULE, not a script path ---
 TRAIN_ENTRY_MODULE=${TRAIN_ENTRY_MODULE:-"SpikeReg.training"}
-# Use 4 processes to match 4 GPUs; SpikeRegTrainer handles DataParallel internally if enabled
-NP=4
+GPUS_PER_NODE="${GPUS_PER_NODE:-4}"
+TOTAL_GPUS=$(( SLURM_NNODES * GPUS_PER_NODE ))
+
+MASTER_ADDR="${MASTER_ADDR:-$(scontrol show hostnames "$SLURM_JOB_NODELIST" | head -n 1)}"
+MASTER_PORT="${MASTER_PORT:-$((15000 + SLURM_JOB_ID % 20000))}"
+export MASTER_ADDR MASTER_PORT
 
 set -x
 # Build arguments array
@@ -106,9 +116,11 @@ fi
 # Add any other arguments
 TRAIN_ARGS+=("${OTHER_ARGS[@]}")
 
-"$PYTHON" -m torch.distributed.run --standalone --nproc_per_node="$NP" \
-  --module "$TRAIN_ENTRY_MODULE" \
-  -- \
+srun \
+  --ntasks="$TOTAL_GPUS" \
+  --ntasks-per-node="$GPUS_PER_NODE" \
+  --kill-on-bad-exit=1 \
+  "$PYTHON" -m "$TRAIN_ENTRY_MODULE" \
   "${TRAIN_ARGS[@]}" \
   |& tee "$RUNDIR/logs/train_${SLURM_JOB_ID}.log"
 set +x

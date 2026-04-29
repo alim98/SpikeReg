@@ -34,6 +34,8 @@ model:
   use_poisson_encoding: false
 
   displacement_scale: 1.0
+  smooth_output_projection: true
+  learnable_output_smoothing: true
 
 # -------- Training configuration --------
 training:

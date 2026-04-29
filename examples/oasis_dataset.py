@@ -1,17 +1,22 @@
 import csv
 import json
+import pickle
 import random
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-import nibabel as nib
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from SpikeReg.utils.patch_utils import extract_patches, PatchAugmentor
+
+try:
+    import nibabel as nib
+except ImportError:  # PKL-only L2R runs do not need nibabel.
+    nib = None
 
 
 # ---------------------------------------------------------------------------
@@ -45,6 +50,8 @@ def normalize_image(image: np.ndarray) -> np.ndarray:
 
 
 def load_volume(path: Path) -> np.ndarray:
+    if nib is None:
+        raise ImportError("nibabel is required for NIfTI loading. Install nibabel or use dataset_format: pkl.")
     volume = np.asarray(nib.load(str(path)).dataobj)
     if volume.ndim == 4:
         volume = volume[..., 0]
@@ -248,7 +255,8 @@ class OASISL2RDataset(Dataset):
         if self.split == "val":
             fixed_subj, moving_subj = self.pairs[index]
         else:
-            fixed_subj, moving_subj = random.sample(self.subjects, 2)
+            rng = random.Random(index)
+            fixed_subj, moving_subj = rng.sample(self.subjects, 2)
 
         fixed_img, fixed_lbl = self._load_subject(fixed_subj)
         moving_img, moving_lbl = self._load_subject(moving_subj)
@@ -263,6 +271,104 @@ class OASISL2RDataset(Dataset):
         if self.split == "val":
             return len(self.pairs)
         return self.num_steps
+
+
+class L2RPKLDataset(Dataset):
+    """
+    Full-volume L2R PKL dataset used by the HViT/OASIS_L2R_2021_task03 pipeline.
+
+    Train directory:
+        All/p_XXXX.pkl -> (image, segmentation)
+
+    Validation directory:
+        Test/p_XXXX_YYYY.pkl -> (fixed, moving, fixed_seg, moving_seg)
+    """
+
+    def __init__(
+        self,
+        data_path: str,
+        split: str = "train",
+        input_dim: Tuple[int, int, int] = (160, 192, 224),
+        num_steps: int = 1000,
+        max_pairs: int = 0,
+        use_labels: bool = True,
+    ):
+        self.data_path = Path(data_path)
+        self.split = split
+        self.input_dim = tuple(int(d) for d in input_dim)
+        self.num_steps = int(num_steps)
+        self.use_labels = use_labels
+        self.eval_label_ids = list(range(1, 36))
+
+        if split == "train":
+            self.subject_files = sorted(self.data_path.glob("*.pkl"))
+            if len(self.subject_files) < 2:
+                raise FileNotFoundError(f"Need at least 2 L2R subject PKLs under {self.data_path}")
+            self.pair_files = None
+        elif split in {"val", "test"}:
+            self.pair_files = sorted(self.data_path.glob("*.pkl"))
+            if max_pairs > 0:
+                self.pair_files = self.pair_files[:max_pairs]
+            if not self.pair_files:
+                raise FileNotFoundError(f"No L2R pair PKLs found under {self.data_path}")
+            self.subject_files = []
+        else:
+            raise ValueError(f"Unsupported split: {split!r}")
+
+    def _resize_image(self, image: np.ndarray) -> torch.Tensor:
+        image_t = torch.from_numpy(image.astype(np.float32)).unsqueeze(0)
+        if tuple(image_t.shape[1:]) != self.input_dim:
+            image_t = resize_volume(image_t, self.input_dim, mode="trilinear")
+        image_t = torch.clamp(image_t, 0.0, 1.0)
+        return image_t
+
+    def _resize_label(self, label: np.ndarray) -> torch.Tensor:
+        label_t = torch.from_numpy(label.astype(np.int64)).unsqueeze(0)
+        if tuple(label_t.shape[1:]) != self.input_dim:
+            label_t = resize_volume(label_t.float(), self.input_dim, mode="nearest").long()
+        return label_t.long()
+
+    def _load_subject(self, path: Path) -> Tuple[torch.Tensor, torch.Tensor]:
+        payload = pickle.load(open(path, "rb"))
+        if not isinstance(payload, (tuple, list)) or len(payload) < 2:
+            raise ValueError(f"Expected subject PKL tuple(image, seg), got {type(payload)} from {path}")
+        image, label = payload[0], payload[1]
+        return self._resize_image(image), self._resize_label(label)
+
+    def _load_pair(self, path: Path) -> Dict[str, torch.Tensor]:
+        payload = pickle.load(open(path, "rb"))
+        if not isinstance(payload, (tuple, list)) or len(payload) not in {2, 4}:
+            raise ValueError(f"Expected pair PKL tuple(fixed, moving[, fixed_seg, moving_seg]), got {type(payload)} from {path}")
+
+        fixed = self._resize_image(payload[0])
+        moving = self._resize_image(payload[1])
+        out: Dict[str, torch.Tensor] = {"fixed": fixed, "moving": moving}
+
+        if self.use_labels and len(payload) == 4:
+            out["segmentation_fixed"] = self._resize_label(payload[2])
+            out["segmentation_moving"] = self._resize_label(payload[3])
+        return out
+
+    def __getitem__(self, index: int) -> Dict[str, torch.Tensor]:
+        if self.split == "train":
+            # DistributedSampler passes rank-specific indices; using the index
+            # here keeps random pair generation rank-sharded and reproducible.
+            rng = random.Random(index)
+            fixed_path, moving_path = rng.sample(self.subject_files, 2)
+            fixed_img, fixed_lbl = self._load_subject(fixed_path)
+            moving_img, moving_lbl = self._load_subject(moving_path)
+            out: Dict[str, torch.Tensor] = {"fixed": fixed_img, "moving": moving_img}
+            if self.use_labels:
+                out["segmentation_fixed"] = fixed_lbl
+                out["segmentation_moving"] = moving_lbl
+            return out
+
+        return self._load_pair(self.pair_files[index])
+
+    def __len__(self) -> int:
+        if self.split == "train":
+            return self.num_steps
+        return len(self.pair_files)
 
 
 # ---------------------------------------------------------------------------
@@ -297,6 +403,43 @@ def create_oasis_full_volume_loaders(
         split="val",
         input_dim=target_shape,
         is_pair=True,
+        use_labels=True,
+    )
+
+    loader_kwargs = {
+        "batch_size": batch_size,
+        "num_workers": num_workers,
+        "pin_memory": pin_memory,
+    }
+    if num_workers > 0 and prefetch_factor is not None:
+        loader_kwargs["prefetch_factor"] = prefetch_factor
+
+    train_loader = torch.utils.data.DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = torch.utils.data.DataLoader(val_ds, shuffle=False, **loader_kwargs)
+    return train_loader, val_loader
+
+
+def create_l2r_pkl_loaders(
+    train_path: str,
+    val_path: str,
+    batch_size: int = 1,
+    target_shape: Tuple[int, int, int] = (160, 192, 224),
+    num_steps: int = 1000,
+    num_workers: int = 4,
+    pin_memory: bool = True,
+    prefetch_factor: Optional[int] = 2,
+) -> Tuple[torch.utils.data.DataLoader, torch.utils.data.DataLoader]:
+    train_ds = L2RPKLDataset(
+        data_path=train_path,
+        split="train",
+        input_dim=target_shape,
+        num_steps=num_steps,
+        use_labels=True,
+    )
+    val_ds = L2RPKLDataset(
+        data_path=val_path,
+        split="val",
+        input_dim=target_shape,
         use_labels=True,
     )
 

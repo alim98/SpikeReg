@@ -105,7 +105,9 @@ class SpikeRegUNet(nn.Module):
             in_channels=self.decoder_channels[-1],
             out_channels=3,  # 3D displacement field
             time_window=5,
-            scale_factor=config.get('displacement_scale', 1.0)
+            scale_factor=config.get('displacement_scale', 1.0),
+            smooth_output=config.get('smooth_output_projection', True),
+            learnable_smoothing=config.get('learnable_output_smoothing', True),
         )
         
         # Input spike encoding parameters
@@ -260,6 +262,8 @@ class SpikeRegUNet(nn.Module):
         """Reset all neuron states in the network"""
         for block in self.encoder_blocks:
             block.conv.reset_neurons()
+            if hasattr(block, 'conv2'):
+                block.conv2.reset_neurons()
             if hasattr(block, 'shortcut') and block.shortcut is not None:
                 block.shortcut.reset_neurons()
         
@@ -300,6 +304,12 @@ class PretrainedUNet(nn.Module):
             )
             self.encoders.append(encoder)
             in_ch = out_ch
+
+        self.bottleneck = nn.Sequential(
+            nn.Conv3d(self.encoder_channels[-1], self.encoder_channels[-1], 3, padding=1),
+            nn.BatchNorm3d(self.encoder_channels[-1]),
+            nn.ReLU(inplace=True),
+        )
         
         # Decoder - match SpikeRegUNet skip_merge logic exactly
         self.decoders = nn.ModuleList()
@@ -357,6 +367,8 @@ class PretrainedUNet(nn.Module):
         for encoder in self.encoders:
             x = encoder(x)
             skip_features.append(x)
+
+        x = self.bottleneck(x)
         
         # ------------------------------------------------------------------
         # Debug printing: run only on the first forward call to help diagnose
@@ -426,43 +438,32 @@ def calibrate_thresholds(
     activation_stats: Dict[str, list] = {}
     hooks = []
 
+    def make_hook(k):
+        def fn(module, inp, out):
+            activation_stats.setdefault(k, []).append(
+                out.detach().cpu().float().clamp(min=0)
+            )
+        return fn
+
     # --- register hooks on BN layers (post-BN activations before ReLU) ---
     # Encoder: encoders[i] = Sequential(Conv, BN, ReLU, Conv, BN, ReLU)
-    # We hook the BN at index 1 (first conv block) for each encoder level.
     for i, enc in enumerate(pretrained_model.encoders):
-        key = f"encoder_{i}"
-        # BN is at index 1 in the sequential (Conv, BN, ReLU, Conv, BN, ReLU)
-        bn = enc[1]
-        def make_hook(k):
-            def fn(module, inp, out):
-                activation_stats.setdefault(k, []).append(
-                    out.detach().cpu().float().clamp(min=0)
-                )
-            return fn
-        hooks.append(bn.register_forward_hook(make_hook(key)))
+        hooks.append(enc[1].register_forward_hook(make_hook(f"encoder_{i}_conv1")))
+        hooks.append(enc[4].register_forward_hook(make_hook(f"encoder_{i}_conv2")))
+
+    if hasattr(pretrained_model, "bottleneck"):
+        hooks.append(pretrained_model.bottleneck[1].register_forward_hook(make_hook("bottleneck")))
 
     # Decoder upconv BN (index 1 in ConvTranspose3d, BN, ReLU sequential)
     for i, dec in enumerate(pretrained_model.decoders):
         key = f"decoder_up_{i}"
         bn = dec[1]
-        def make_hook(k):
-            def fn(module, inp, out):
-                activation_stats.setdefault(k, []).append(
-                    out.detach().cpu().float().clamp(min=0)
-                )
-            return fn
         hooks.append(bn.register_forward_hook(make_hook(key)))
 
     # Decoder refine BN (index 1 in Conv, BN, ReLU sequential)
     for i, ref in enumerate(pretrained_model.decoder_refines):
         key = f"decoder_refine_{i}"
         bn = ref[1]
-        def make_hook(k):
-            def fn(module, inp, out):
-                activation_stats.setdefault(k, []).append(
-                    out.detach().cpu().float().clamp(min=0)
-                )
-            return fn
         hooks.append(bn.register_forward_hook(make_hook(key)))
 
     with torch.no_grad():
@@ -494,11 +495,17 @@ def _apply_calibrated_thresholds(
 ) -> None:
     """Apply per-layer calibrated thresholds to LIF neurons in the spiking model."""
     for i, enc_block in enumerate(spiking_model.encoder_blocks):
-        key = f"encoder_{i}"
-        if key in thresholds:
-            th = thresholds[key]
+        key1 = f"encoder_{i}_conv1"
+        key2 = f"encoder_{i}_conv2"
+        legacy_key = f"encoder_{i}"
+        if key1 in thresholds or legacy_key in thresholds:
+            th = thresholds.get(key1, thresholds.get(legacy_key))
             with torch.no_grad():
                 enc_block.conv.neurons.v_th.fill_(th)
+        if hasattr(enc_block, "conv2") and (key2 in thresholds or legacy_key in thresholds):
+            th = thresholds.get(key2, thresholds.get(legacy_key))
+            with torch.no_grad():
+                enc_block.conv2.neurons.v_th.fill_(th)
 
     for i, dec_block in enumerate(spiking_model.decoder_blocks):
         key_up = f"decoder_up_{i}"
@@ -514,11 +521,14 @@ def _apply_calibrated_thresholds(
                 dec_block.refine.neurons.v_th.fill_(th)
 
     if hasattr(spiking_model, 'bottleneck'):
-        # Use mean of encoder thresholds for bottleneck
-        enc_vals = [v for k, v in thresholds.items() if k.startswith('encoder_')]
-        if enc_vals:
+        if "bottleneck" in thresholds:
             with torch.no_grad():
-                spiking_model.bottleneck.neurons.v_th.fill_(sum(enc_vals) / len(enc_vals))
+                spiking_model.bottleneck.neurons.v_th.fill_(thresholds["bottleneck"])
+        else:
+            enc_vals = [v for k, v in thresholds.items() if k.startswith('encoder_')]
+            if enc_vals:
+                with torch.no_grad():
+                    spiking_model.bottleneck.neurons.v_th.fill_(sum(enc_vals) / len(enc_vals))
 
 
 def convert_pretrained_to_spiking(
@@ -561,6 +571,30 @@ def convert_pretrained_to_spiking(
         spiking_enc.conv.bn.bias.data = bn_bias.clone()
         spiking_enc.conv.bn.running_mean = bn_mean.clone()
         spiking_enc.conv.bn.running_var = bn_var.clone()
+
+        conv2_weight = pretrained_enc[3].weight.data
+        conv2_bias = pretrained_enc[3].bias.data if pretrained_enc[3].bias is not None else None
+        bn2_weight = pretrained_enc[4].weight.data
+        bn2_bias = pretrained_enc[4].bias.data
+        bn2_mean = pretrained_enc[4].running_mean
+        bn2_var = pretrained_enc[4].running_var
+
+        spiking_enc.conv2.conv.weight.data = conv2_weight.clone()
+        if conv2_bias is not None:
+            spiking_enc.conv2.conv.bias.data = conv2_bias.clone()
+        spiking_enc.conv2.bn.weight.data = bn2_weight.clone()
+        spiking_enc.conv2.bn.bias.data = bn2_bias.clone()
+        spiking_enc.conv2.bn.running_mean = bn2_mean.clone()
+        spiking_enc.conv2.bn.running_var = bn2_var.clone()
+
+    if hasattr(pretrained_model, "bottleneck") and hasattr(spiking_model, "bottleneck"):
+        spiking_model.bottleneck.conv.weight.data = pretrained_model.bottleneck[0].weight.data.clone()
+        if pretrained_model.bottleneck[0].bias is not None:
+            spiking_model.bottleneck.conv.bias.data = pretrained_model.bottleneck[0].bias.data.clone()
+        spiking_model.bottleneck.bn.weight.data = pretrained_model.bottleneck[1].weight.data.clone()
+        spiking_model.bottleneck.bn.bias.data = pretrained_model.bottleneck[1].bias.data.clone()
+        spiking_model.bottleneck.bn.running_mean = pretrained_model.bottleneck[1].running_mean.clone()
+        spiking_model.bottleneck.bn.running_var = pretrained_model.bottleneck[1].running_var.clone()
     
     # Transfer decoder weights
     for i, (pretrained_dec, pretrained_refine, spiking_dec) in enumerate(

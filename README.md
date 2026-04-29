@@ -5,13 +5,13 @@
 [![Python 3.8+](https://img.shields.io/badge/python-3.8+-blue.svg)](https://www.python.org/downloads/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0+-ee4c2c.svg)](https://pytorch.org/)
 
-SpikeReg is a novel approach to deformable medical image registration that leverages Spiking Neural Networks (SNNs) to achieve orders-of-magnitude energy savings while maintaining high registration accuracy. This implementation provides a complete PyTorch-based framework for training and deploying SpikeReg models.
+SpikeReg is a research prototype for deformable medical image registration with Spiking Neural Networks (SNNs). The project is set up to train an ANN registration baseline, convert it to a spiking model, fine-tune with surrogate gradients, and evaluate accuracy against operation-count based energy proxies.
 
 ## 🚀 Key Features
 
-- **Energy Efficient**: ~10⁻² × lower energy consumption compared to GPU baselines
-- **Real-time Performance**: ~150ms for full 3D volume registration
-- **Neuromorphic Ready**: Optimized for deployment on neuromorphic hardware (e.g., Intel Loihi)
+- **Energy Analysis**: Reports MAC/AC counts and analytical energy proxies from measured spike rates
+- **Full-Volume L2R Evaluation**: Includes label-wise Dice, HD95, NCC, and Jacobian folding metrics
+- **Neuromorphic-Oriented**: Designed around sparse spiking activity and ANN-to-SNN conversion
 - **Progressive Refinement**: Iterative residual policy for coarse-to-fine registration
 - **Patch-based Processing**: Memory-efficient tiling for large medical volumes
 
@@ -41,17 +41,14 @@ pip install -e ".[neuromorphic]"
 ### Training a SpikeReg Model
 
 ```python
-from spikereg import SpikeRegUNet, SpikeRegTrainer
-from spikereg.utils import load_config
+from spikereg import SpikeRegTrainer
+from spikereg.training import load_config
 
 # Load configuration
-config = load_config("configs/default_config.yaml")
-
-# Initialize model
-model  = SpikeRegUNet(config['model'])  
+config = load_config("configs/spikereg_l2r_config.yaml")
 
 # Create trainer
-trainer = SpikeRegTrainer(model, config)
+trainer = SpikeRegTrainer(config)
 
 # Train
 trainer.train(train_loader, val_loader, num_epochs=100)
@@ -85,11 +82,18 @@ SpikeReg implements a Spiking U-Net architecture with:
 
 ## 📊 Benchmarks
 
-| Method | Energy (mJ) | Latency (ms) | Dice Score |
-|--------|-------------|--------------|------------|
-| VoxelMorph (GPU) | 450 | 85 | 0.89 |
-| SpikeReg (Loihi 2) | 4.5 | 150 | 0.87 |
-| SpikeReg (GPU Sim) | 125 | 210 | 0.87 |
+No publication-ready benchmark numbers are claimed yet. Use `evaluate_oasis.py` to evaluate a checkpoint on the L2R validation pairs:
+
+```bash
+python evaluate_oasis.py \
+  --checkpoint checkpoints/spikereg/final_model.pth \
+  --config configs/spikereg_l2r_config.yaml \
+  --dataset-format pkl \
+  --data-root /path/to/OASIS_L2R_2021_task03/Test \
+  --output-json results/l2r_eval.json
+```
+
+Report at minimum mean +/- std label-wise Dice, HD95, NCC, and the fraction of voxels with non-positive Jacobian determinant. Energy numbers should be reported as analytical proxies unless measured on actual neuromorphic hardware.
 
 ## 🧪 Testing
 

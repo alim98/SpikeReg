@@ -142,7 +142,7 @@ def stitch_patches(
         valid_h = h_end - h
         valid_w = w_end - w
         
-        if blend_mode == 'average':
+        if blend_mode in {'average', 'cosine', 'linear', 'gaussian'}:
             # Add weighted patch
             output[:, :, d:d_end, h:h_end, w:w_end] += \
                 patch[:, :, :valid_d, :valid_h, :valid_w] * window[:, :, :valid_d, :valid_h, :valid_w]
@@ -160,7 +160,7 @@ def stitch_patches(
             )
     
     # Normalize by weights
-    if blend_mode == 'average':
+    if blend_mode in {'average', 'cosine', 'linear', 'gaussian'}:
         output = output / (weights + 1e-8)
     
     return output
@@ -227,6 +227,7 @@ def create_blending_window(
         window = torch.ones(pd, ph, pw, device=device)
     
     # Add batch and channel dimensions
+    window = torch.clamp(window, min=1e-3)
     window = window.unsqueeze(0).unsqueeze(0)
     
     return window

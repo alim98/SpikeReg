@@ -174,6 +174,11 @@ class SpikingEncoderBlock(nn.Module):
             stride=stride, padding=kernel_size // 2,
             tau_u=tau_u, lateral_inhibition=lateral_inhibition
         )
+        self.conv2 = SpikingConv3d(
+            out_channels, out_channels, kernel_size,
+            stride=1, padding=kernel_size // 2,
+            tau_u=tau_u, lateral_inhibition=lateral_inhibition
+        )
 
         if residual and stride == 1 and in_channels == out_channels:
             self.shortcut = nn.Identity()
@@ -208,6 +213,7 @@ class SpikingEncoderBlock(nn.Module):
         out_C = conv.out_channels
 
         self.conv.reset_neurons(B, out_C, out_D, out_H, out_W)
+        self.conv2.reset_neurons(B, out_C, out_D, out_H, out_W)
 
         if hasattr(self.shortcut, "reset_neurons"):
             sc_conv = self.shortcut.conv
@@ -226,6 +232,7 @@ class SpikingEncoderBlock(nn.Module):
         spike_outputs = []
         for t in range(time_steps):
             spikes = self.conv(x)
+            spikes = self.conv2(spikes)
             if self.shortcut is not None:
                 spikes = spikes + self.shortcut(x)
             spike_outputs.append(spikes)
@@ -420,12 +427,15 @@ class OutputProjection(nn.Module):
         in_channels: int,
         out_channels: int = 3,  # 3D displacement field
         time_window: int = 5,
-        scale_factor: float = 1.0
+        scale_factor: float = 1.0,
+        smooth_output: bool = True,
+        learnable_smoothing: bool = True,
     ):
         super().__init__()
         
         self.time_window = time_window
         self.scale_factor = scale_factor
+        self.smooth_output = smooth_output
         
         # Final convolution
         self.conv = nn.Conv3d(
@@ -433,17 +443,19 @@ class OutputProjection(nn.Module):
             stride=1, padding=0, bias=True
         )
         
-        # Smooth output
-        self.smooth = nn.Conv3d(
-            out_channels, out_channels, kernel_size=3,
-            stride=1, padding=1, bias=False, groups=out_channels
-        )
-        
-        # Initialize smoothing kernel as fixed averaging kernel
-        with torch.no_grad():
-            kernel = torch.ones(out_channels, 1, 3, 3, 3) / 27.0
-            self.smooth.weight.data = kernel
-            self.smooth.weight.requires_grad_(False)
+        if smooth_output:
+            self.smooth = nn.Conv3d(
+                out_channels, out_channels, kernel_size=3,
+                stride=1, padding=1, bias=False, groups=out_channels
+            )
+
+            # Start from a mild averaging kernel, but let training adapt it.
+            with torch.no_grad():
+                kernel = torch.ones(out_channels, 1, 3, 3, 3) / 27.0
+                self.smooth.weight.data = kernel
+            self.smooth.weight.requires_grad_(learnable_smoothing)
+        else:
+            self.smooth = nn.Identity()
     
     def forward(self, spike_tensor: torch.Tensor) -> torch.Tensor:
         """
@@ -461,7 +473,6 @@ class OutputProjection(nn.Module):
         # Project to displacement channels
         displacement = self.conv(spike_rates)
         
-        # Smooth the output
         displacement = self.smooth(displacement)
         
         # Scale output

@@ -6,6 +6,9 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
+from torch.utils.data.distributed import DistributedSampler
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from aim import Repo, Run
 import numpy as np
 from tqdm import tqdm
@@ -15,12 +18,13 @@ import argparse
 import yaml
 import json
 from contextlib import redirect_stdout
+from pathlib import Path
 
 from .models import SpikeRegUNet, PretrainedUNet, convert_pretrained_to_spiking, calibrate_thresholds
 from .registration import IterativeRegistration
 from .losses import SpikeRegLoss, PretrainLoss
 from .utils.warping import SpatialTransformer
-from .utils.metrics import dice_score, jacobian_determinant_stats
+from .utils.metrics import labelwise_dice_score, jacobian_determinant_stats
 
 
 class SpikeRegTrainer:
@@ -54,6 +58,10 @@ class SpikeRegTrainer:
         self.use_multi_gpu = self.multi_gpu_config.get('use_multi_gpu', False)
         self.gpu_ids = self.multi_gpu_config.get('gpu_ids', None)
         self.distributed = self.multi_gpu_config.get('distributed', False)
+        self.rank = 0
+        self.local_rank = 0
+        self.world_size = 1
+        self.is_distributed = False
         
         # Setup multi-GPU / distributed environment
         self._setup_multi_gpu()
@@ -62,17 +70,7 @@ class SpikeRegTrainer:
         os.makedirs(checkpoint_dir, exist_ok=True)
         os.makedirs(log_dir, exist_ok=True)
         
-        # Initialize Aim only on main process
-        # Consider environments spawned via torch.distributed.run
-        local_rank = os.getenv("LOCAL_RANK")
-        rank = os.getenv("RANK")
-        is_main_process = True
-        if local_rank is not None and local_rank != '0':
-            is_main_process = False
-        if rank is not None and rank != '0':
-            is_main_process = False
-        
-        self.is_main_process = is_main_process
+        self.is_main_process = self.rank == 0
 
         self.aim_run = None
         self.aim_run_hash = None
@@ -116,6 +114,45 @@ class SpikeRegTrainer:
             for i in range(torch.cuda.device_count()):
                 print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
         
+        # Slurm/srun exports SLURM_* ranks rather than torchrun's RANK/LOCAL_RANK.
+        if self.distributed:
+            self.rank = int(os.getenv("RANK", os.getenv("SLURM_PROCID", "0")))
+            self.local_rank = int(os.getenv("LOCAL_RANK", os.getenv("SLURM_LOCALID", "0")))
+            self.world_size = int(os.getenv("WORLD_SIZE", os.getenv("SLURM_NTASKS", "1")))
+            os.environ.setdefault("RANK", str(self.rank))
+            os.environ.setdefault("LOCAL_RANK", str(self.local_rank))
+            os.environ.setdefault("WORLD_SIZE", str(self.world_size))
+
+            if torch.cuda.is_available():
+                num_gpus = torch.cuda.device_count()
+                if num_gpus == 0:
+                    raise RuntimeError("Distributed GPU training requested but no CUDA devices are visible.")
+                self.local_rank = self.local_rank % num_gpus
+                self.gpu_ids = [self.local_rank]
+                torch.cuda.set_device(self.local_rank)
+                self.device = torch.device(f"cuda:{self.local_rank}")
+                backend = "nccl"
+            else:
+                self.device = torch.device("cpu")
+                backend = "gloo"
+
+            self.is_distributed = self.world_size > 1
+            if self.is_distributed and not dist.is_initialized():
+                os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+                os.environ.setdefault("MASTER_PORT", "29500")
+                dist.init_process_group(backend=backend, init_method="env://")
+
+            print(
+                f"Using DDP rank {self.rank}/{self.world_size} "
+                f"on local_rank={self.local_rank}, device={self.device}"
+            )
+            with open(self.log_file, 'a') as f:
+                f.write(
+                    f"Using DDP rank {self.rank}/{self.world_size} "
+                    f"on local_rank={self.local_rank}, device={self.device}\n"
+                )
+            return
+
         if not torch.cuda.is_available():
             print(f"Training on single device: {self.device}")
             with open(self.log_file, 'a') as f:
@@ -178,8 +215,20 @@ class SpikeRegTrainer:
     
     def _wrap_model_for_multi_gpu(self, model):
         """Wrap model for multi-GPU training"""
-        # In distributed mode we rely on torch.distributed.run for multi-process parallelism
-        if self.distributed:
+        if self.distributed and self.is_distributed:
+            find_unused = bool(self.multi_gpu_config.get("find_unused_parameters", False))
+            if torch.cuda.is_available():
+                model = DistributedDataParallel(
+                    model,
+                    device_ids=[self.local_rank],
+                    output_device=self.local_rank,
+                    find_unused_parameters=find_unused,
+                )
+            else:
+                model = DistributedDataParallel(model, find_unused_parameters=find_unused)
+            print(f"Model wrapped with DistributedDataParallel on rank {self.rank}")
+            with open(self.log_file, 'a') as f:
+                f.write(f"Model wrapped with DistributedDataParallel on rank {self.rank}\n")
             return model
 
         if not self.use_multi_gpu or len(self.gpu_ids) < 2:
@@ -282,7 +331,11 @@ class SpikeRegTrainer:
     
     def _init_optimizer(self):
         """Initialize optimizer and scheduler"""
-        optimizer_config = self.config['training']['optimizer']
+        train_config = self.config['training']
+        if self.training_phase == 'finetune' and 'optimizer_finetune' in train_config:
+            optimizer_config = train_config['optimizer_finetune']
+        else:
+            optimizer_config = train_config['optimizer']
         
         if optimizer_config['type'] == 'adam':
             self.optimizer = optim.Adam(
@@ -302,7 +355,10 @@ class SpikeRegTrainer:
             f.write(f"Initialized optimizer: {optimizer_config['type']} with lr={optimizer_config['lr']}\n")
         
         # Learning rate scheduler, casting config values to correct types
-        scheduler_config = self.config['training'].get('scheduler', {})
+        if self.training_phase == 'finetune' and 'scheduler_finetune' in train_config:
+            scheduler_config = train_config.get('scheduler_finetune', {})
+        else:
+            scheduler_config = train_config.get('scheduler', {})
         if scheduler_config.get('type') == 'cosine':
             T_max = int(scheduler_config.get('T_max', 100))
             eta_min = float(scheduler_config.get('eta_min', 1e-6))
@@ -355,7 +411,7 @@ class SpikeRegTrainer:
             f.write(f"Initialized loss function: {self.criterion.__class__.__name__}\n")
             f.write(f"Loss config: {json.dumps(loss_config, indent=2)}\n")
     
-    def _freeze_batch_norm(self):
+    def _freeze_batch_norm(self, verbose: bool = True):
         """Freeze all BatchNorm3d layers in the current model"""
         if self.current_model is None:
             return
@@ -372,13 +428,18 @@ class SpikeRegTrainer:
                 m.bias.requires_grad_(False)
                 frozen_count += 1
         
-        print(f"Frozen {frozen_count} BatchNorm3d layers for SNN fine-tune")
-        with open(self.log_file, 'a') as f:
-            f.write(f"Frozen {frozen_count} BatchNorm3d layers for SNN fine-tune\n")
+        if verbose:
+            print(f"Frozen {frozen_count} BatchNorm3d layers for SNN fine-tune")
+            with open(self.log_file, 'a') as f:
+                f.write(f"Frozen {frozen_count} BatchNorm3d layers for SNN fine-tune\n")
     
     def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
         """Train for one epoch"""
         self.current_model.train()
+        if self.training_phase == 'finetune':
+            self._freeze_batch_norm(verbose=False)
+        if hasattr(train_loader, "sampler") and hasattr(train_loader.sampler, "set_epoch"):
+            train_loader.sampler.set_epoch(self.epoch)
         with open(self.log_file, 'a') as f:
             f.write(f"Starting training epoch {self.epoch}\n")
         
@@ -399,6 +460,8 @@ class SpikeRegTrainer:
         epoch_metrics = {}
         train_loss_component_sums: Dict[str, float] = {}
         train_loss_component_count: int = 0
+        displacement_mean_norms = []
+        displacement_max_norms = []
         
         for batch_idx, batch in enumerate(progress_bar):
                     # Get data
@@ -442,6 +505,11 @@ class SpikeRegTrainer:
                                     
                     # Backward pass
                     loss.backward()
+
+                    with torch.no_grad():
+                        disp_norm = torch.linalg.norm(displacement.detach(), dim=1)
+                        displacement_mean_norms.append(float(disp_norm.mean().item()))
+                        displacement_max_norms.append(float(disp_norm.max().item()))
                     
                     # Gradient clipping
                     if self.config['training'].get('gradient_clip', 0) > 0:
@@ -473,6 +541,9 @@ class SpikeRegTrainer:
         if train_loss_component_count > 0:
             for comp_name, comp_sum in train_loss_component_sums.items():
                 epoch_metrics[f'loss_{comp_name}'] = comp_sum / train_loss_component_count
+        if displacement_mean_norms:
+            epoch_metrics['displacement_mean_norm'] = float(np.mean(displacement_mean_norms))
+            epoch_metrics['displacement_max_norm'] = float(np.max(displacement_max_norms))
         
         with open(self.log_file, 'a') as f:
             f.write(f"Completed training epoch {self.epoch}\n")
@@ -502,6 +573,12 @@ class SpikeRegTrainer:
         val_jacobian_stats = []
         val_loss_component_sums: Dict[str, float] = {}
         val_loss_component_count: int = 0
+        displacement_mean_norms = []
+        displacement_max_norms = []
+        dataset = getattr(val_loader, "dataset", None)
+        if isinstance(dataset, Subset):
+            dataset = dataset.dataset
+        eval_label_ids = getattr(dataset, "eval_label_ids", None)
 
         for batch_idx, batch in enumerate(tqdm(val_loader, desc="Validation")):
             fixed = batch['fixed'].to(self.device)
@@ -543,20 +620,29 @@ class SpikeRegTrainer:
                 seg_moving = batch['segmentation_moving'].to(self.device)
                 seg_warped = self.seg_spatial_transformer(seg_moving.float(), displacement).long()
 
-                dice = dice_score(seg_warped, seg_fixed)
+                dice = labelwise_dice_score(seg_warped, seg_fixed, label_ids=eval_label_ids)
+                mean_dice = torch.nanmean(dice) if dice.numel() else torch.tensor(float("nan"), device=self.device)
 
                 if batch_idx == 0 and self.epoch % 5 == 0:
-                    print(f"[validate] Dice sanity check: min={dice.min().item():.4f}, max={dice.max().item():.4f}, mean={dice.mean().item():.4f}, shape={dice.shape}")
+                    finite_dice = dice[torch.isfinite(dice)]
+                    if finite_dice.numel() > 0:
+                        print(f"[validate] Label Dice sanity check: min={finite_dice.min().item():.4f}, max={finite_dice.max().item():.4f}, mean={finite_dice.mean().item():.4f}, labels={finite_dice.numel()}")
 
-                val_dice_scores.append(float(dice.mean().item()))
+                if torch.isfinite(mean_dice).item():
+                    val_dice_scores.append(float(mean_dice.item()))
 
             jac_stats = jacobian_determinant_stats(displacement)
             val_jacobian_stats.append(jac_stats)
+            disp_norm = torch.linalg.norm(displacement.detach(), dim=1)
+            displacement_mean_norms.append(float(disp_norm.mean().item()))
+            displacement_max_norms.append(float(disp_norm.max().item()))
 
         metrics = {
             'val_loss': float(np.mean(val_losses)) if val_losses else 0.0,
             'val_dice': float(np.mean(val_dice_scores)) if val_dice_scores else 0.0,
-            'val_jac_negative': float(np.mean([s['negative_fraction'] for s in val_jacobian_stats])) if val_jacobian_stats else 0.0
+            'val_jac_negative': float(np.mean([s['negative_fraction'] for s in val_jacobian_stats])) if val_jacobian_stats else 0.0,
+            'val_displacement_mean_norm': float(np.mean(displacement_mean_norms)) if displacement_mean_norms else 0.0,
+            'val_displacement_max_norm': float(np.max(displacement_max_norms)) if displacement_max_norms else 0.0,
         }
 
         if val_loss_component_count > 0:
@@ -594,9 +680,11 @@ class SpikeRegTrainer:
             
             # Training epoch
             train_metrics = self.train_epoch(train_loader)
+            train_metrics = self._reduce_metrics(train_metrics)
             
             # Validation
             val_metrics = self.validate(val_loader)
+            val_metrics = self._reduce_metrics(val_metrics)
             
             # Learning rate scheduling
             if self.scheduler is not None:
@@ -625,6 +713,27 @@ class SpikeRegTrainer:
                 f.write(f"Epoch {epoch}: Train Loss: {train_metrics['loss']:.4f}, "
                         f"Val Loss: {val_metrics['val_loss']:.4f}, "
                         f"Val Dice: {val_metrics['val_dice']:.4f}\n")
+
+        if self.is_distributed and dist.is_initialized():
+            dist.barrier()
+
+    def _reduce_metrics(self, metrics: Dict[str, float]) -> Dict[str, float]:
+        """Average scalar metrics across DDP ranks."""
+        if not (self.is_distributed and dist.is_initialized()):
+            return metrics
+
+        reduced = {}
+        for key, value in metrics.items():
+            try:
+                value_float = float(value)
+            except Exception:
+                reduced[key] = value
+                continue
+            tensor = torch.tensor(value_float, device=self.device, dtype=torch.float32)
+            dist.all_reduce(tensor, op=dist.ReduceOp.SUM)
+            tensor /= self.world_size
+            reduced[key] = float(tensor.item())
+        return reduced
         
     def convert_to_spiking(self, calibration_loader=None):
         """Convert pretrained model to spiking with optional threshold calibration"""
@@ -673,6 +782,8 @@ class SpikeRegTrainer:
     def save_checkpoint(self, filename: str):
         """Save model checkpoint (only on main process to avoid race conditions)"""
         if not self.is_main_process:
+            if self.is_distributed and dist.is_initialized():
+                dist.barrier()
             return
         
         checkpoint = {
@@ -699,6 +810,8 @@ class SpikeRegTrainer:
         print(f"Saved checkpoint: {path}")
         with open(self.log_file, 'a') as f:
             f.write(f"Saved checkpoint: {path}\n")
+        if self.is_distributed and dist.is_initialized():
+            dist.barrier()
     def load_checkpoint(self, filename: str):
         """Load model checkpoint with staggered delays to avoid concurrent file access race conditions"""
         import sys, numpy as np
@@ -897,8 +1010,24 @@ def _create_loaders_from_config(config: Dict) -> Tuple[DataLoader, DataLoader]:
     pin_memory = train_cfg.get('pin_memory', True)
 
     use_full_volume = data_cfg.get('full_volume', False)
+    dataset_format = str(data_cfg.get('dataset_format', 'l2r_nii')).lower()
 
-    if use_full_volume:
+    if use_full_volume and dataset_format in {"pkl", "l2r_pkl"}:
+        from examples.oasis_dataset import create_l2r_pkl_loaders
+        resample = data_cfg.get('resample_size', [160, 192, 224])
+        target_shape = tuple(int(x) for x in resample)
+        num_steps = int(data_cfg.get('num_steps', 1000))
+        train_loader, val_loader = create_l2r_pkl_loaders(
+            train_dir,
+            data_cfg.get('val_dir'),
+            batch_size=batch_size,
+            target_shape=target_shape,
+            num_steps=num_steps,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            prefetch_factor=int(train_cfg.get('prefetch_factor', 2)) if num_workers > 0 else None,
+        )
+    elif use_full_volume:
         from examples.oasis_dataset import create_oasis_full_volume_loaders
         resample = data_cfg.get('resample_size', [160, 192, 224])
         target_shape = tuple(int(x) for x in resample)
@@ -952,7 +1081,54 @@ def _create_loaders_from_config(config: Dict) -> Tuple[DataLoader, DataLoader]:
                 **loader_kwargs,
             )
 
+    train_loader, val_loader = _wrap_loaders_for_distributed(
+        train_loader,
+        val_loader,
+        batch_size=batch_size,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        prefetch_factor=int(train_cfg.get('prefetch_factor', 2)) if num_workers > 0 else None,
+    )
+
     return train_loader, val_loader
+
+
+def _wrap_loaders_for_distributed(
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    batch_size: int,
+    num_workers: int,
+    pin_memory: bool,
+    prefetch_factor: Optional[int],
+) -> Tuple[DataLoader, DataLoader]:
+    world_size = int(os.getenv("WORLD_SIZE", os.getenv("SLURM_NTASKS", "1")))
+    if world_size <= 1:
+        return train_loader, val_loader
+
+    rank = int(os.getenv("RANK", os.getenv("SLURM_PROCID", "0")))
+
+    def rebuild(loader: DataLoader, shuffle: bool) -> DataLoader:
+        sampler = DistributedSampler(
+            loader.dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            drop_last=False,
+        )
+        kwargs = {
+            "batch_size": batch_size,
+            "sampler": sampler,
+            "num_workers": num_workers,
+            "pin_memory": pin_memory,
+            "drop_last": getattr(loader, "drop_last", False),
+            "collate_fn": loader.collate_fn,
+        }
+        if num_workers > 0 and prefetch_factor is not None:
+            kwargs["prefetch_factor"] = prefetch_factor
+            kwargs["persistent_workers"] = getattr(loader, "persistent_workers", False)
+        return DataLoader(loader.dataset, **kwargs)
+
+    return rebuild(train_loader, shuffle=True), rebuild(val_loader, shuffle=False)
 
 
 def main_cli():
@@ -966,15 +1142,6 @@ def main_cli():
     parser.add_argument('--start_from_checkpoint', help='Path to checkpoint to resume from')
     parser.add_argument('--aim_repo', type=str, default=None, help='Path to Aim repository (overrides AIM_REPO env)')
     args = parser.parse_args()
-
-    if args.start_from_checkpoint:
-        base = os.path.basename(args.start_from_checkpoint)
-        if base.startswith('finetune_') or base.startswith('converted_') or base == 'final_model.pth':
-            d = os.path.dirname(args.start_from_checkpoint)
-            p = os.path.join(d, 'pretrained_model.pth')
-            if os.path.exists(p):
-                print(f"[main_cli] Redirecting from {base} to pretrained_model.pth for pretrain→convert→finetune flow")
-                args.start_from_checkpoint = p
 
     cfg = load_config(args.config)
 
@@ -1024,7 +1191,7 @@ def main_cli():
         trainer.train(train_loader, val_loader, num_epochs=999999)  # Large number to run until timeout
     else:
         # Check if we need to run pretrain
-        if do_pretrain and trainer.pretrained_model is not None and pretrain_epochs > 0:
+        if do_pretrain and trainer.training_phase == 'pretrain' and trainer.pretrained_model is not None and pretrain_epochs > 0:
             # Check if we're resuming pretrain (checkpoint loaded and in pretrain phase)
             resuming_pretrain = args.start_from_checkpoint and trainer.training_phase == 'pretrain' and trainer.epoch >= 0
             

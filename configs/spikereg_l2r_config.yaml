@@ -1,0 +1,100 @@
+# SpikeReg L2R full-volume PKL configuration.
+# Data layout matches the HViT L2R cache:
+#   All/p_XXXX.pkl          -> (image, segmentation)
+#   Test/p_XXXX_YYYY.pkl    -> (fixed, moving, fixed_seg, moving_seg)
+
+model:
+  in_channels: 2
+  encoder_channels: [16, 32, 64, 128]
+  decoder_channels: [64, 32, 16, 16]
+  encoder_time_windows: [4, 4, 4, 4]
+  decoder_time_windows: [4, 4, 4, 4]
+  input_time_window: 4
+  encoder_tau_u: [0.9, 0.85, 0.8, 0.75]
+  decoder_tau_u: [0.75, 0.8, 0.85, 0.9]
+  skip_merge: ["concatenate", "concatenate", "average", "none"]
+  use_poisson_encoding: false
+  displacement_scale: 1.0
+  smooth_output_projection: true
+  learnable_output_smoothing: true
+
+training:
+  pretrain: true
+  pretrain_epochs: 300
+  finetune_epochs: 100
+  num_iterations: 1
+  early_stop_threshold: 0.001
+
+  optimizer:
+    type: "adam"
+    lr: 0.0001
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+  optimizer_finetune:
+    type: "adam"
+    lr: 0.00005
+    weight_decay: 0.0
+    betas: [0.9, 0.999]
+    eps: 1.0e-8
+
+  scheduler:
+    type: "cosine"
+    T_max: 300
+    eta_min: 1.0e-6
+  scheduler_finetune:
+    type: "cosine"
+    T_max: 100
+    eta_min: 1.0e-6
+
+  loss:
+    similarity_type: "ncc"
+    similarity_weight: 1.0
+    ncc_win: 9
+    regularization_type: "diffusion"
+    regularization_weight: 1.0
+    spike_weight: 0.0001
+    spike_balance_weight: 0.01
+    target_spike_rate: 0.1
+
+  batch_size: 1
+  gradient_clip: 1.0
+  num_workers: 8
+  pin_memory: true
+  prefetch_factor: 2
+  checkpoint_interval: 10
+  val_every_epochs: 1
+  save_keep_last: 5
+
+conversion:
+  threshold_percentile: 99.5
+  calibration_samples: 50
+
+inference:
+  patch_size: 128
+  patch_stride: 64
+  batch_size: 1
+  smooth_displacement: true
+
+data:
+  dataset_format: "pkl"
+  full_volume: true
+  resample_size: [128, 128, 128]
+  num_steps: 394
+  debug_percent: 100.0
+  train_dir: "/nexus/posix0/MBR-neuralsystems/alim/regdata/oasistransmorph/OASIS_L2R_2021_task03/All"
+  val_dir: "/nexus/posix0/MBR-neuralsystems/alim/regdata/oasistransmorph/OASIS_L2R_2021_task03/Test"
+  test_dir: "/nexus/posix0/MBR-neuralsystems/alim/regdata/oasistransmorph/OASIS_L2R_2021_task03/Challenge_test_no_gt"
+
+multi_gpu:
+  use_multi_gpu: true
+  gpu_ids: [0, 1, 2, 3]
+  distributed: true
+  find_unused_parameters: false
+
+neuromorphic:
+  weight_bits: 8
+  threshold_bits: 8
+  cores_per_layer: 4
+  max_spikes_per_core: 1000
+  dt: 1.0

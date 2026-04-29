@@ -5,6 +5,7 @@ Evaluation metrics for SpikeReg
 import torch
 import torch.nn.functional as F
 import numpy as np
+from scipy import ndimage
 from typing import Dict, List, Optional, Tuple, Union
 
 
@@ -87,6 +88,140 @@ def dice_score(
     dice = (2.0 * intersection + smooth) / (pred_sum + target_sum + smooth)
     dice = torch.clamp(dice, 0.0, 1.0)
     return dice
+
+
+def _label_tensor(labels: Optional[Union[List[int], Tuple[int, ...]]], pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    if labels is not None:
+        return torch.as_tensor(labels, device=pred.device, dtype=torch.long)
+
+    unique = torch.unique(torch.cat([pred.long().reshape(-1), target.long().reshape(-1)]))
+    return unique[unique != 0]
+
+
+def labelwise_dice_score(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    label_ids: Optional[Union[List[int], Tuple[int, ...]]] = None,
+    smooth: float = 1e-5,
+    ignore_missing: bool = True,
+) -> torch.Tensor:
+    """
+    Compute Dice per anatomical label, excluding background by default.
+
+    Missing labels are returned as NaN when ignore_missing=True so they do not
+    inflate the mean Dice score.
+    """
+    if pred.dim() == 5 and pred.size(1) == 1:
+        pred = pred[:, 0]
+    if target.dim() == 5 and target.size(1) == 1:
+        target = target[:, 0]
+    if pred.dim() == 3:
+        pred = pred.unsqueeze(0)
+    if target.dim() == 3:
+        target = target.unsqueeze(0)
+    if pred.shape != target.shape:
+        raise ValueError(f"pred and target shape mismatch: {pred.shape} vs {target.shape}")
+
+    pred = pred.long()
+    target = target.long()
+    labels = _label_tensor(label_ids, pred, target)
+    if labels.numel() == 0:
+        return torch.empty(pred.shape[0], 0, device=pred.device)
+
+    scores = []
+    for label in labels:
+        pred_mask = pred == label
+        target_mask = target == label
+        pred_sum = pred_mask.flatten(1).sum(dim=1).float()
+        target_sum = target_mask.flatten(1).sum(dim=1).float()
+        intersection = (pred_mask & target_mask).flatten(1).sum(dim=1).float()
+        denom = pred_sum + target_sum
+        dice = (2.0 * intersection + smooth) / (denom + smooth)
+        if ignore_missing:
+            dice = torch.where(
+                denom > 0,
+                dice,
+                torch.full_like(dice, float("nan")),
+            )
+        scores.append(dice)
+    return torch.stack(scores, dim=1)
+
+
+def mean_labelwise_dice(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    label_ids: Optional[Union[List[int], Tuple[int, ...]]] = None,
+    smooth: float = 1e-5,
+    ignore_missing: bool = True,
+) -> torch.Tensor:
+    dice = labelwise_dice_score(pred, target, label_ids, smooth, ignore_missing)
+    if dice.numel() == 0:
+        return torch.tensor(float("nan"), device=pred.device)
+    return torch.nanmean(dice)
+
+
+def _surface_distances_np(
+    mask_a: np.ndarray,
+    mask_b: np.ndarray,
+    spacing: Optional[Tuple[float, float, float]] = None,
+) -> np.ndarray:
+    mask_a = np.asarray(mask_a).astype(bool)
+    mask_b = np.asarray(mask_b).astype(bool)
+    if not mask_a.any() or not mask_b.any():
+        return np.asarray([], dtype=np.float32)
+
+    structure = ndimage.generate_binary_structure(mask_a.ndim, 1)
+    surface_a = mask_a ^ ndimage.binary_erosion(mask_a, structure=structure, border_value=0)
+    surface_b = mask_b ^ ndimage.binary_erosion(mask_b, structure=structure, border_value=0)
+    if not surface_a.any() or not surface_b.any():
+        return np.asarray([], dtype=np.float32)
+
+    distance_to_b = ndimage.distance_transform_edt(~surface_b, sampling=spacing)
+    distance_to_a = ndimage.distance_transform_edt(~surface_a, sampling=spacing)
+    return np.concatenate([distance_to_b[surface_a], distance_to_a[surface_b]]).astype(np.float32)
+
+
+def labelwise_hd95(
+    pred: torch.Tensor,
+    target: torch.Tensor,
+    label_ids: Optional[Union[List[int], Tuple[int, ...]]] = None,
+    spacing: Optional[Tuple[float, float, float]] = None,
+    ignore_missing: bool = True,
+) -> Dict[int, float]:
+    """
+    Compute symmetric 95th percentile Hausdorff distance per label.
+    """
+    if pred.dim() == 5 and pred.size(1) == 1:
+        pred = pred[:, 0]
+    if target.dim() == 5 and target.size(1) == 1:
+        target = target[:, 0]
+    if pred.dim() == 4:
+        if pred.size(0) != 1:
+            raise ValueError("labelwise_hd95 expects one volume at a time")
+        pred = pred[0]
+    if target.dim() == 4:
+        if target.size(0) != 1:
+            raise ValueError("labelwise_hd95 expects one volume at a time")
+        target = target[0]
+
+    labels = _label_tensor(label_ids, pred, target).detach().cpu().tolist()
+    pred_np = pred.detach().cpu().numpy()
+    target_np = target.detach().cpu().numpy()
+    results: Dict[int, float] = {}
+    for label in labels:
+        pred_mask = pred_np == int(label)
+        target_mask = target_np == int(label)
+        if not pred_mask.any() or not target_mask.any():
+            if not ignore_missing:
+                results[int(label)] = float("inf")
+            continue
+        distances = _surface_distances_np(pred_mask, target_mask, spacing)
+        if distances.size == 0:
+            if not ignore_missing:
+                results[int(label)] = float("inf")
+            continue
+        results[int(label)] = float(np.percentile(distances, 95))
+    return results
 
 
 def jacobian_determinant(displacement: torch.Tensor) -> torch.Tensor:
@@ -347,11 +482,12 @@ def compute_energy_estimate(
     Uses operation-count model from:
       Horowitz, "Computing's Energy Problem," ISSCC 2014.
 
-    E_SNN  = sum_layers(spike_rate * n_neurons * n_synapses * E_AC)
+    E_SNN  = sum_layers(time_steps * spike_rate * n_neurons * n_synapses * E_AC)
     E_ANN  = sum_layers(n_neurons * n_synapses * E_MAC)
-    ratio  = E_SNN / E_ANN = avg_spike_rate * (E_AC / E_MAC)
+    ratio  = E_SNN / E_ANN = time_steps * avg_spike_rate * (E_AC / E_MAC)
 
-    With avg_spike_rate=0.10 and the default constants this gives ~50× reduction.
+    With avg_spike_rate=0.10, T=4, and the default constants this gives ~13×
+    arithmetic-operation energy reduction before memory/routing overheads.
     """
     if encoder_channels is None:
         encoder_channels = [16, 32, 64, 128]
@@ -363,7 +499,7 @@ def compute_energy_estimate(
     )
 
     # energy ratio (dimensionless)
-    energy_ratio = mean_spike_rate * (E_AC_pJ / E_MAC_pJ)
+    energy_ratio = time_steps * mean_spike_rate * (E_AC_pJ / E_MAC_pJ)
     reduction_factor = 1.0 / energy_ratio if energy_ratio > 0 else float("inf")
 
     # approximate MAC counts for the ANN (conv3d: in_ch * out_ch * k^3 * spatial)
@@ -440,19 +576,29 @@ def compute_registration_metrics(
         # Warp segmentation
         from .warping import SpatialTransformer
         transformer = SpatialTransformer(mode='nearest')
-        warped_seg = transformer(moving_seg.float(), displacement)
+        warped_seg = transformer(moving_seg.float(), displacement).long()
         
-        # Dice score
-        dice = dice_score(warped_seg, fixed_seg)
-        metrics['dice'] = dice.mean().item()
+        label_ids = sorted(
+            int(x) for x in torch.unique(torch.cat([
+                warped_seg.long().reshape(-1),
+                fixed_seg.long().reshape(-1),
+            ])).detach().cpu().tolist()
+            if int(x) != 0
+        )
+        dice = labelwise_dice_score(warped_seg, fixed_seg.long(), label_ids=label_ids)
+        metrics['dice'] = float(torch.nanmean(dice).item()) if dice.numel() else float("nan")
+        metrics['dice_num_labels'] = int(torch.isfinite(dice).sum().item())
         
         # Surface distance
         if warped_seg.shape[0] == 1:  # Single volume
-            surf_metrics = surface_distance(
+            hd95_by_label = labelwise_hd95(
                 warped_seg.squeeze().long(),
                 fixed_seg.squeeze().long(),
-                spacing
+                label_ids=label_ids,
+                spacing=spacing,
             )
-            metrics.update({f'surface_{k}': v for k, v in surf_metrics.items()})
+            if hd95_by_label:
+                metrics['hd95'] = float(np.mean(list(hd95_by_label.values())))
+                metrics['hd95_num_labels'] = len(hd95_by_label)
     
     return metrics 

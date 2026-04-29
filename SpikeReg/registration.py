@@ -177,19 +177,34 @@ class SpikeRegInference:
         checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
         if config is None:
             config = checkpoint.get('config', {})
-        
-        self.model = SpikeRegUNet(config).to(self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
+
+        self.config = config
+        model_config = config.get('model', config)
+        training_config = config.get('training', {})
+        inference_config = config.get('inference', {})
+        self.patch_size = inference_config.get('patch_size', self.patch_size)
+        self.patch_stride = inference_config.get('patch_stride', self.patch_stride)
+        self.batch_size = inference_config.get('batch_size', self.batch_size)
+
+        self.model = SpikeRegUNet(model_config).to(self.device)
+        state = checkpoint.get('model_state_dict', checkpoint)
+        if any(k.startswith("module.") for k in state):
+            state = {k[len("module."):]: v for k, v in state.items()}
+        self.model.load_state_dict(state)
         self.model.eval()
         
         # Create iterative registration module
         self.registration = IterativeRegistration(
             self.model,
-            num_iterations=config.get('num_iterations', 10),
-            early_stop_threshold=config.get('early_stop_threshold', 0.001)
+            num_iterations=inference_config.get(
+                'num_iterations',
+                training_config.get('num_iterations', config.get('num_iterations', 10))
+            ),
+            early_stop_threshold=inference_config.get(
+                'early_stop_threshold',
+                training_config.get('early_stop_threshold', config.get('early_stop_threshold', 0.001))
+            )
         )
-        
-        self.config = config
     
     def preprocess_volume(
         self,
@@ -296,7 +311,8 @@ class SpikeRegInference:
         )
         
         # Apply optional smoothing
-        if self.config.get('smooth_displacement', True):
+        inference_config = self.config.get('inference', {}) if isinstance(self.config, dict) else {}
+        if inference_config.get('smooth_displacement', self.config.get('smooth_displacement', True)):
             displacement_field = self._smooth_displacement_field(displacement_field)
         
         # Convert to numpy
