@@ -4,12 +4,13 @@ Training utilities for SpikeReg
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import DataLoader, Subset
 from torch.utils.data.distributed import DistributedSampler
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel
-from aim import Repo, Run
+from torch.utils.tensorboard import SummaryWriter
 import numpy as np
 from tqdm import tqdm
 import os
@@ -41,7 +42,7 @@ class SpikeRegTrainer:
         log_dir: str = "logs",
         device: str = "cuda",
         multi_gpu_config: Dict = None,
-        aim_repo: Optional[str] = None,
+        tensorboard_dir: Optional[str] = None,
         run_name: Optional[str] = None,
     ):
         self.config = config
@@ -72,29 +73,25 @@ class SpikeRegTrainer:
         
         self.is_main_process = self.rank == 0
 
-        self.aim_run = None
-        self.aim_run_hash = None
-        self.aim_repo_path = None
-        self.aim_repo = None
+        self.tb_writer = None
         
-        # Initialize models
         self.pretrained_model = None
         self.spiking_model = None
         self.current_model = None
         self.registration = None
+        self.teacher_model = None
         
         # Training state (epoch-based only)
         self.epoch = -1
         self.best_val_loss = float('inf')
         self.training_phase = 'pretrain'  # Track current phase: 'pretrain' or 'finetune'
         
-        if is_main_process:
-            self.aim_repo_path = aim_repo or os.getenv("AIM_REPO") or os.path.dirname(self.checkpoint_dir)
-            self.aim_repo = Repo(self.aim_repo_path)
-            self._init_aim_run(run_name=run_name)
-        else:
-            with open(self.log_file, 'a') as f:
-                f.write("Aim logging disabled on non-main process (rank/LOCAL_RANK != 0)\n")
+        if self.is_main_process:
+            tb_dir = tensorboard_dir or os.getenv("TENSORBOARD_DIR") or os.path.join(log_dir, "tensorboard")
+            os.makedirs(tb_dir, exist_ok=True)
+            self.tb_writer = SummaryWriter(log_dir=tb_dir)
+            if run_name:
+                self.tb_writer.add_text("run_name", str(run_name), 0)
         
         # Initialize components
         self._init_models()
@@ -217,6 +214,11 @@ class SpikeRegTrainer:
         """Wrap model for multi-GPU training"""
         if self.distributed and self.is_distributed:
             find_unused = bool(self.multi_gpu_config.get("find_unused_parameters", False))
+            # Spiking model in finetune always has frozen BN (requires_grad=False).
+            # DDP with find_unused_parameters=False panics when those params never
+            # receive a gradient.  Force True for the finetune phase.
+            if self.training_phase == 'finetune':
+                find_unused = True
             if torch.cuda.is_available():
                 model = DistributedDataParallel(
                     model,
@@ -242,55 +244,6 @@ class SpikeRegTrainer:
             f.write(f"Model wrapped for multi-GPU training on devices: {self.gpu_ids}\n")
         return model
     
-    def _init_aim_run(self, run_name: Optional[str] = None, run_hash: Optional[str] = None):
-        if not self.is_main_process or self.aim_repo is None:
-            return
-        
-        if run_hash:
-            try:
-                self.aim_run = Run(run_hash=run_hash, repo=self.aim_repo, read_only=False)
-                self.aim_run_hash = run_hash
-                print(f"Reopened existing Aim run: {run_hash}")
-                self._update_aim_tags()
-                return
-            except Exception as e:
-                print(f"Warning: Could not reopen Aim run {run_hash}: {e}")
-                print("Creating new Aim run instead...")
-        
-        self.aim_run = Run(repo=self.aim_repo)
-        self.aim_run_hash = self.aim_run.hash
-        self.aim_run["config"] = self.config
-        self.aim_run["checkpoint_dir"] = self.checkpoint_dir
-        self.aim_run["log_dir"] = self.log_dir
-        
-        effective_run_name = run_name or os.getenv("SLURM_JOB_ID")
-        if effective_run_name:
-            try:
-                self.aim_run.name = str(effective_run_name)
-            except Exception:
-                self.aim_run["run_name"] = str(effective_run_name)
-        
-        if os.getenv("SLURM_JOB_ID"):
-            self.aim_run["job_id"] = os.getenv("SLURM_JOB_ID")
-        
-        self._update_aim_tags()
-    
-    def _update_aim_tags(self):
-        if self.aim_run is None or not self.is_main_process:
-            return
-        try:
-            self.aim_run.add_tag('spikereg')
-        except Exception as e:
-            if 'UNIQUE' not in str(e) and 'already' not in str(e).lower():
-                print(f"Warning: Could not add Aim tag: {e}")
-        try:
-            if self.training_phase == 'pretrain':
-                self.aim_run.add_tag('pretrain')
-            elif self.training_phase == 'finetune':
-                self.aim_run.add_tag('finetune')
-        except Exception as e:
-            if 'UNIQUE' not in str(e) and 'already' not in str(e).lower():
-                print(f"Warning: Could not add Aim tag: {e}")
     
     def _init_models(self):
         """Initialize models based on training phase"""
@@ -305,7 +258,6 @@ class SpikeRegTrainer:
         else:
             # Initialize spiking model directly
             self.training_phase = 'finetune'
-            self._update_aim_tags()
             self.spiking_model = SpikeRegUNet(self.config['model']).to(self.device)
             # Wrap for multi-GPU if enabled
             self.spiking_model = self._wrap_model_for_multi_gpu(self.spiking_model)
@@ -322,7 +274,6 @@ class SpikeRegTrainer:
             self.current_model = self.spiking_model
 
             self.training_phase = 'finetune'
-            self._update_aim_tags()
             self._init_optimizer()
             self._init_loss()
 
@@ -433,6 +384,41 @@ class SpikeRegTrainer:
             with open(self.log_file, 'a') as f:
                 f.write(f"Frozen {frozen_count} BatchNorm3d layers for SNN fine-tune\n")
     
+    def _setup_teacher(self):
+        distill_weight = self.config['training']['loss'].get('distillation_weight', 0.0)
+        if distill_weight <= 0:
+            return
+
+        base = None
+        if self.pretrained_model is not None:
+            base = self.pretrained_model
+            if hasattr(base, 'module'):
+                base = base.module
+
+        if base is None:
+            pretrained_path = os.path.join(self.checkpoint_dir, 'pretrained_model.pth')
+            if os.path.exists(pretrained_path):
+                from .models import PretrainedUNet
+                base = PretrainedUNet(self.config['model']).to(self.device)
+                ckpt = torch.load(pretrained_path, map_location=self.device, weights_only=False)
+                state = ckpt.get('model_state_dict', ckpt)
+                if any(k.startswith('module.') for k in state.keys()):
+                    state = {k[len('module.'):]: v for k, v in state.items()}
+                base.load_state_dict(state, strict=False)
+                print(f"[teacher] Loaded pretrained ANN from {pretrained_path}")
+                with open(self.log_file, 'a') as f:
+                    f.write(f"[teacher] Loaded pretrained ANN from {pretrained_path}\n")
+            else:
+                print("[teacher] No pretrained_model.pth found, distillation disabled.")
+                with open(self.log_file, 'a') as f:
+                    f.write("[teacher] No pretrained_model.pth found, distillation disabled.\n")
+                return
+
+        base.eval()
+        for p in base.parameters():
+            p.requires_grad_(False)
+        self.teacher_model = base
+
     def train_epoch(self, train_loader: DataLoader) -> Dict[str, float]:
         """Train for one epoch"""
         self.current_model.train()
@@ -485,7 +471,6 @@ class SpikeRegTrainer:
                                 loss_dict[k] = v.item()
 
                     else:
-                        # Spiking model - single-pass prediction (no iterative loop during training)
                         output = self.current_model(fixed, moving)
                         displacement = output['displacement']
                         warped = self.spatial_transformer(moving, displacement)
@@ -495,14 +480,21 @@ class SpikeRegTrainer:
                             with open(self.log_file, 'a') as f:
                                 f.write(f"Warning: Batch {batch_idx} has NaN in displacement or warped\n")
 
-                        # Full loss computation
                         loss, loss_dict = self.criterion(
                             fixed, moving, displacement, warped, spike_counts
                         )
                         for k, v in loss_dict.items():
                             if torch.is_tensor(v):
                                 loss_dict[k] = v.item()
-                                    
+
+                        distill_weight = self.config['training']['loss'].get('distillation_weight', 0.0)
+                        if distill_weight > 0 and self.teacher_model is not None:
+                            with torch.no_grad():
+                                teacher_disp = self.teacher_model(fixed, moving)
+                            distill = F.mse_loss(displacement, teacher_disp)
+                            loss = loss + distill_weight * distill
+                            loss_dict['distillation'] = float(distill.item())
+
                     # Backward pass
                     loss.backward()
 
@@ -674,6 +666,7 @@ class SpikeRegTrainer:
         
         if self.training_phase == 'finetune':
             self._freeze_batch_norm()
+            self._setup_teacher()
         
         for epoch in range(start_epoch, num_epochs):
             self.epoch = epoch
@@ -704,15 +697,14 @@ class SpikeRegTrainer:
                 # Cleanup old checkpoints to save disk space
                 # self._cleanup_old_checkpoints()
             
-            # Print epoch summary
-            print(f"Epoch {epoch}: Train Loss: {train_metrics['loss']:.4f}, "
-                  f"Val Loss: {val_metrics['val_loss']:.4f}, "
-                  f"Val Dice: {val_metrics['val_dice']:.4f}")
-            
-            with open(self.log_file, 'a') as f:
-                f.write(f"Epoch {epoch}: Train Loss: {train_metrics['loss']:.4f}, "
-                        f"Val Loss: {val_metrics['val_loss']:.4f}, "
-                        f"Val Dice: {val_metrics['val_dice']:.4f}\n")
+            if self.is_main_process:
+                print(f"Epoch {epoch}: Train Loss: {train_metrics['loss']:.4f}, "
+                      f"Val Loss: {val_metrics['val_loss']:.4f}, "
+                      f"Val Dice: {val_metrics['val_dice']:.4f}")
+                with open(self.log_file, 'a') as f:
+                    f.write(f"Epoch {epoch}: Train Loss: {train_metrics['loss']:.4f}, "
+                            f"Val Loss: {val_metrics['val_loss']:.4f}, "
+                            f"Val Dice: {val_metrics['val_dice']:.4f}\n")
 
         if self.is_distributed and dist.is_initialized():
             dist.barrier()
@@ -746,7 +738,6 @@ class SpikeRegTrainer:
 
         # Switch to finetune phase
         self.training_phase = 'finetune'
-        self._update_aim_tags()
 
         # Get the underlying model if wrapped with DataParallel
         base_model = self.pretrained_model
@@ -793,7 +784,6 @@ class SpikeRegTrainer:
             'optimizer_state_dict': self.optimizer.state_dict(),
             'best_val_loss': self.best_val_loss,
             'config': self.config,
-            'aim_run_hash': self.aim_run_hash,
         }
         
         if self.scheduler is not None:
@@ -919,9 +909,8 @@ class SpikeRegTrainer:
             if key in state:
                 del state[key]
         
-        if skipped_layers and self.aim_run is not None:
-            self.aim_run["skipped_layers"] = skipped_layers
-            print(f"[load_checkpoint] Logged {len(skipped_layers)} skipped layers to Aim")
+        if skipped_layers:
+            print(f"[load_checkpoint] Skipped {len(skipped_layers)} layers: {skipped_layers}")
 
         # 4) load weights ONCE (lenient)
         missing, unexpected = self.current_model.load_state_dict(state, strict=False)
@@ -953,39 +942,18 @@ class SpikeRegTrainer:
         with open(self.log_file, 'a') as f:
             f.write(f"Loaded checkpoint from epoch {self.epoch}\n")
         
-        if self.is_main_process and 'aim_run_hash' in checkpoint and checkpoint['aim_run_hash']:
-            saved_run_hash = checkpoint['aim_run_hash']
-            if self.aim_run_hash != saved_run_hash:
-                print(f"Reopening Aim run from checkpoint: {saved_run_hash}")
-                self._init_aim_run(run_hash=saved_run_hash)
 
     
     def _log_epoch_metrics(self, train_metrics: Dict[str, float], val_metrics: Dict[str, float]):
-        """Log epoch metrics to Aim with phase separation"""
-        if self.aim_run is None:
+        if self.tb_writer is None:
             return
-        
-        # Log with phase prefix for clear separation in Aim
         phase = self.training_phase
-        
-        # Training metrics with phase
         for name, value in train_metrics.items():
-            # name could be 'loss' or 'loss_total' or 'loss_similarity' etc.
-            self.aim_run.track(value, name=f'{phase}/train_{name}', step=self.epoch, context={'phase': phase})
-
-        # Validation metrics with phase
+            self.tb_writer.add_scalar(f'{phase}/train_{name}', value, self.epoch)
         for name, value in val_metrics.items():
-            self.aim_run.track(value, name=f'{phase}/{name}', step=self.epoch, context={'phase': phase})
-        
-        # Log learning rate with phase
+            self.tb_writer.add_scalar(f'{phase}/{name}', value, self.epoch)
         current_lr = self.optimizer.param_groups[0]['lr']
-        self.aim_run.track(current_lr, name=f'{phase}/learning_rate', step=self.epoch, context={'phase': phase})
-        
-        # Also log to generic epoch metrics for overall tracking
-        for name, value in train_metrics.items():
-            self.aim_run.track(value, name=f'epoch/train_{name}', step=self.epoch)
-        for name, value in val_metrics.items():
-            self.aim_run.track(value, name=f'epoch/{name}', step=self.epoch)
+        self.tb_writer.add_scalar(f'{phase}/learning_rate', current_lr, self.epoch)
 
 
 def load_config(config_path: str) -> Dict:
@@ -1140,7 +1108,7 @@ def main_cli():
     parser.add_argument('--device', default='cuda', help='Device to use (cuda/cpu)')
     parser.add_argument('--name', help='Run name (e.g., SLURM job id)')
     parser.add_argument('--start_from_checkpoint', help='Path to checkpoint to resume from')
-    parser.add_argument('--aim_repo', type=str, default=None, help='Path to Aim repository (overrides AIM_REPO env)')
+    parser.add_argument('--tensorboard_dir', type=str, default=None, help='TensorBoard log directory (overrides TENSORBOARD_DIR env)')
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -1157,7 +1125,7 @@ def main_cli():
         log_dir=args.log_dir,
         device=args.device,
         multi_gpu_config=multi_gpu_cfg,
-        aim_repo=args.aim_repo,
+        tensorboard_dir=args.tensorboard_dir,
         run_name=args.name,
     )
 

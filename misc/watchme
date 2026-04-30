@@ -1,0 +1,1 @@
+watch -n 5 'squeue -u $USER -o "%.18i %.9P %.40j %.8u %.2t %.10M %.6D %.20S %R"'

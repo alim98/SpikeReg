@@ -17,11 +17,12 @@ model:
   displacement_scale: 1.0
   smooth_output_projection: true
   learnable_output_smoothing: true
+  learnable_neurons: true
 
 training:
   pretrain: true
   pretrain_epochs: 300
-  finetune_epochs: 100
+  finetune_epochs: 200
   num_iterations: 1
   early_stop_threshold: 0.001
 
@@ -33,7 +34,7 @@ training:
     eps: 1.0e-8
   optimizer_finetune:
     type: "adam"
-    lr: 0.00005
+    lr: 0.0001
     weight_decay: 0.0
     betas: [0.9, 0.999]
     eps: 1.0e-8
@@ -44,22 +45,23 @@ training:
     eta_min: 1.0e-6
   scheduler_finetune:
     type: "cosine"
-    T_max: 100
-    eta_min: 1.0e-6
+    T_max: 200
+    eta_min: 1.0e-5
 
   loss:
     similarity_type: "ncc"
     similarity_weight: 1.0
     ncc_win: 9
     regularization_type: "diffusion"
-    regularization_weight: 1.0
+    regularization_weight: 0.1
     spike_weight: 0.0001
     spike_balance_weight: 0.01
     target_spike_rate: 0.1
+    distillation_weight: 0.5
 
   batch_size: 1
   gradient_clip: 1.0
-  num_workers: 8
+  num_workers: 2
   pin_memory: true
   prefetch_factor: 2
   checkpoint_interval: 10
@@ -67,7 +69,7 @@ training:
   save_keep_last: 5
 
 conversion:
-  threshold_percentile: 99.5
+  threshold_percentile: 50.0
   calibration_samples: 50
 
 inference:
@@ -79,7 +81,7 @@ inference:
 data:
   dataset_format: "pkl"
   full_volume: true
-  resample_size: [128, 128, 128]
+  resample_size: [160, 192, 224]
   num_steps: 394
   debug_percent: 100.0
   train_dir: "/nexus/posix0/MBR-neuralsystems/alim/regdata/oasistransmorph/OASIS_L2R_2021_task03/All"
@@ -90,7 +92,7 @@ multi_gpu:
   use_multi_gpu: true
   gpu_ids: [0, 1, 2, 3]
   distributed: true
-  find_unused_parameters: false
+  find_unused_parameters: true
 
 neuromorphic:
   weight_bits: 8

@@ -6,12 +6,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$SCRIPT_DIR"
 
 JOB_SCRIPT="${JOB_SCRIPT:-$SCRIPT_DIR/train_spikereg.sh}"
-RUN_ROOT="${RUN_ROOT:-$REPO_ROOT/checkpoints/spikereg/runs}"
+EXPERIMENT_ROOT="${EXPERIMENT_ROOT:-/nexus/posix0/MBR-neuralsystems/alim/experiments3/SR}"
+RUN_ROOT="${RUN_ROOT:-$EXPERIMENT_ROOT/runs}"
 CONFIG_DEFAULT="${CONFIG_DEFAULT:-$REPO_ROOT/configs/spikereg_l2r_config.yaml}"
 
 RUN_TAG="${RUN_TAG:-$(date +"%Y%m%d-%H%M%S")}"
 GROUP_DIR="${RUN_ROOT}/${RUN_TAG}"
-mkdir -p "$GROUP_DIR" "$REPO_ROOT/slurm/output_spikereg" "$REPO_ROOT/slurm/error_spikereg"
+mkdir -p "$GROUP_DIR" "$REPO_ROOT/slurm/output_spikereg" "$REPO_ROOT/slurm/error_spikereg" "$EXPERIMENT_ROOT"
 ln -sfn "$GROUP_DIR" "${RUN_ROOT}/latest_group"
 
 START_FROM=""
@@ -94,10 +95,10 @@ submit_job() {
   mkdir -p "$GROUP_DIR/logs"
   if [[ -n "$ckpt" ]]; then
     echo "[launcher] Submitting job with checkpoint: $ckpt" >&2
-    sbatch_out=$(sbatch "$JOB_SCRIPT" --config "$cfg" --start_from_checkpoint "$ckpt" "${EXTRA_ARGS[@]}")
+    sbatch_out=$(sbatch --export="ALL,EXPERIMENT_ROOT=${EXPERIMENT_ROOT}" "$JOB_SCRIPT" --config "$cfg" --start_from_checkpoint "$ckpt" "${EXTRA_ARGS[@]}")
   else
     echo "[launcher] Submitting job without checkpoint (fresh start)" >&2
-    sbatch_out=$(sbatch "$JOB_SCRIPT" --config "$cfg" "${EXTRA_ARGS[@]}")
+    sbatch_out=$(sbatch --export="ALL,EXPERIMENT_ROOT=${EXPERIMENT_ROOT}" "$JOB_SCRIPT" --config "$cfg" "${EXTRA_ARGS[@]}")
   fi
   printf "%s\n" "$sbatch_out"
 }

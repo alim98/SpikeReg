@@ -31,27 +31,24 @@ class SpikingConv3d(nn.Module):
         lateral_inhibition: bool = False,
         k_fraction: float = 0.1,
         adaptive: bool = False,
+        learnable_params: bool = False,
         **neuron_kwargs
     ):
         super().__init__()
         
-        # Convolutional layer
         self.conv = nn.Conv3d(
             in_channels, out_channels, kernel_size,
             stride=stride, padding=padding, dilation=dilation,
             groups=groups, bias=bias
         )
         
-        # Batch normalization (for ANN-to-SNN conversion)
         self.bn = nn.BatchNorm3d(out_channels)
         
-        # Spiking neurons
         if adaptive:
-            self.neurons = AdaptiveLIFNeuron(tau_u=tau_u, v_th=v_th, **neuron_kwargs)
+            self.neurons = AdaptiveLIFNeuron(tau_u=tau_u, v_th=v_th, learnable_params=learnable_params, **neuron_kwargs)
         else:
-            self.neurons = LIFNeuron(tau_u=tau_u, v_th=v_th, **neuron_kwargs)
+            self.neurons = LIFNeuron(tau_u=tau_u, v_th=v_th, learnable_params=learnable_params, **neuron_kwargs)
         
-        # Lateral inhibition
         self.lateral_inhibition = lateral_inhibition
         if lateral_inhibition:
             self.inhibition = LateralInhibition(k_fraction=k_fraction)
@@ -111,22 +108,20 @@ class SpikingTransposeConv3d(nn.Module):
         bias: bool = True,
         tau_u: float = 0.9,
         v_th: float = 1.0,
+        learnable_params: bool = False,
         **neuron_kwargs
     ):
         super().__init__()
         
-        # Transposed convolutional layer
         self.conv = nn.ConvTranspose3d(
             in_channels, out_channels, kernel_size,
             stride=stride, padding=padding, output_padding=output_padding,
             groups=groups, bias=bias
         )
         
-        # Batch normalization
         self.bn = nn.BatchNorm3d(out_channels)
         
-        # Spiking neurons
-        self.neurons = LIFNeuron(tau_u=tau_u, v_th=v_th, **neuron_kwargs)
+        self.neurons = LIFNeuron(tau_u=tau_u, v_th=v_th, learnable_params=learnable_params, **neuron_kwargs)
     
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass through spiking transpose conv layer"""
@@ -162,7 +157,8 @@ class SpikingEncoderBlock(nn.Module):
         tau_u: float = 0.9,
         time_window: int = 10,
         lateral_inhibition: bool = True,
-        residual: bool = False
+        residual: bool = False,
+        learnable_params: bool = False,
     ):
         super().__init__()
 
@@ -172,12 +168,14 @@ class SpikingEncoderBlock(nn.Module):
         self.conv = SpikingConv3d(
             in_channels, out_channels, kernel_size,
             stride=stride, padding=kernel_size // 2,
-            tau_u=tau_u, lateral_inhibition=lateral_inhibition
+            tau_u=tau_u, lateral_inhibition=lateral_inhibition,
+            learnable_params=learnable_params,
         )
         self.conv2 = SpikingConv3d(
             out_channels, out_channels, kernel_size,
             stride=1, padding=kernel_size // 2,
-            tau_u=tau_u, lateral_inhibition=lateral_inhibition
+            tau_u=tau_u, lateral_inhibition=lateral_inhibition,
+            learnable_params=learnable_params,
         )
 
         if residual and stride == 1 and in_channels == out_channels:
@@ -185,7 +183,8 @@ class SpikingEncoderBlock(nn.Module):
         elif residual:
             self.shortcut = SpikingConv3d(
                 in_channels, out_channels, kernel_size=1,
-                stride=stride, padding=0, tau_u=tau_u
+                stride=stride, padding=0, tau_u=tau_u,
+                learnable_params=learnable_params,
             )
         else:
             self.shortcut = None
@@ -255,7 +254,8 @@ class SpikingDecoderBlock(nn.Module):
         tau_u: float = 0.9,
         time_window: int = 10,
         skip_merge: str = "concatenate",
-        attention: bool = False
+        attention: bool = False,
+        learnable_params: bool = False,
     ):
         super().__init__()
 
@@ -267,7 +267,7 @@ class SpikingDecoderBlock(nn.Module):
 
         self.upconv = SpikingTransposeConv3d(
             in_channels, out_channels, kernel_size,
-            stride=stride, tau_u=tau_u
+            stride=stride, tau_u=tau_u, learnable_params=learnable_params,
         )
 
         if skip_merge == "attention" and attention:
@@ -286,7 +286,7 @@ class SpikingDecoderBlock(nn.Module):
 
         self.refine = SpikingConv3d(
             refine_in_channels, out_channels, kernel_size=3,
-            stride=1, padding=1, tau_u=tau_u
+            stride=1, padding=1, tau_u=tau_u, learnable_params=learnable_params,
         )
 
     def forward(

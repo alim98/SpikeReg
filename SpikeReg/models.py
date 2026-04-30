@@ -33,18 +33,15 @@ class SpikeRegUNet(nn.Module):
         self.encoder_channels = config.get('encoder_channels', [16, 32, 64, 128])
         self.decoder_channels = config.get('decoder_channels', [64, 32, 16, 16])
         
-        # Time windows for each level (decreasing)
         self.encoder_time_windows = config.get('encoder_time_windows', [10, 8, 6, 4])
         self.decoder_time_windows = config.get('decoder_time_windows', [4, 6, 8, 10])
         
-        # Neuron parameters for each level
         self.encoder_tau_u = config.get('encoder_tau_u', [0.9, 0.8, 0.8, 0.7])
         self.decoder_tau_u = config.get('decoder_tau_u', [0.7, 0.8, 0.8, 0.9])
         
-        # Skip connection merge strategies
         self.skip_merge = config.get('skip_merge', ['concatenate', 'average', 'concatenate', 'none'])
+        self.learnable_neurons = config.get('learnable_neurons', False)
         
-        # Build encoder
         self.encoder_blocks = nn.ModuleList()
         in_ch = self.in_channels
         for i, out_ch in enumerate(self.encoder_channels):
@@ -55,13 +52,13 @@ class SpikeRegUNet(nn.Module):
                 stride=2,
                 tau_u=self.encoder_tau_u[i],
                 time_window=self.encoder_time_windows[i],
-                lateral_inhibition=(i > 0),  # No inhibition in first layer
-                residual=(i > 1)  # Residual connections in deeper layers
+                lateral_inhibition=(i > 0),
+                residual=(i > 1),
+                learnable_params=self.learnable_neurons,
             )
             self.encoder_blocks.append(block)
             in_ch = out_ch
         
-        # Bottleneck
         self.bottleneck = SpikingConv3d(
             self.encoder_channels[-1],
             self.encoder_channels[-1],
@@ -69,10 +66,10 @@ class SpikeRegUNet(nn.Module):
             stride=1,
             padding=1,
             tau_u=0.7,
-            lateral_inhibition=True
+            lateral_inhibition=True,
+            learnable_params=self.learnable_neurons,
         )
         
-        # Build decoder
         self.decoder_blocks = nn.ModuleList()
         prev_out_ch = self.encoder_channels[-1]
         for i in range(len(self.decoder_channels)):
@@ -94,7 +91,8 @@ class SpikeRegUNet(nn.Module):
                 tau_u=self.decoder_tau_u[i],
                 time_window=self.decoder_time_windows[i],
                 skip_merge=self.skip_merge[i],
-                attention=(i < 2)
+                attention=(i < 2),
+                learnable_params=self.learnable_neurons,
             )
             self.decoder_blocks.append(block)
             
@@ -472,11 +470,16 @@ def calibrate_thresholds(
             moving = batch['moving'].to(device)
             pretrained_model(fixed, moving)
 
+    _QUANTILE_MAX = 2_000_000
+
     thresholds: Dict[str, float] = {}
     for key, acts_list in activation_stats.items():
         all_acts = torch.cat([a.flatten() for a in acts_list])
         positive = all_acts[all_acts > 0]
         if positive.numel() > 0:
+            if positive.numel() > _QUANTILE_MAX:
+                idx = torch.randperm(positive.numel(), device=positive.device)[:_QUANTILE_MAX]
+                positive = positive[idx]
             thresholds[key] = torch.quantile(positive, percentile / 100.0).item()
         else:
             thresholds[key] = 1.0
