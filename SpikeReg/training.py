@@ -18,6 +18,7 @@ from typing import Dict, Optional, Tuple, List
 import argparse
 import yaml
 import json
+from collections import defaultdict
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -25,7 +26,7 @@ from .models import SpikeRegUNet, PretrainedUNet, convert_pretrained_to_spiking,
 from .registration import IterativeRegistration
 from .losses import SpikeRegLoss, PretrainLoss
 from .utils.warping import SpatialTransformer
-from .utils.metrics import labelwise_dice_score, jacobian_determinant_stats
+from .utils.metrics import compute_energy_estimate, labelwise_dice_score, jacobian_determinant_stats
 
 
 class SpikeRegTrainer:
@@ -102,6 +103,35 @@ class SpikeRegTrainer:
         self.spatial_transformer = SpatialTransformer()
         # Transformer for discrete segmentation labels using nearest neighbor
         self.seg_spatial_transformer = SpatialTransformer(mode='nearest', padding_mode='border')
+
+    def _time_steps_from_config(self) -> int:
+        model_cfg = self.config.get('model', {})
+        candidates = [model_cfg.get('input_time_window', 4)]
+        candidates.extend(model_cfg.get('encoder_time_windows', []) or [])
+        candidates.extend(model_cfg.get('decoder_time_windows', []) or [])
+        return int(max(int(v) for v in candidates))
+
+    @staticmethod
+    def _spike_rates_to_floats(spike_counts: Dict) -> Dict[str, float]:
+        rates = {}
+        for key, value in spike_counts.items():
+            if torch.is_tensor(value):
+                rates[key] = float(value.detach().float().mean().cpu().item())
+            else:
+                rates[key] = float(value)
+        return rates
+
+    def _energy_from_spike_rates(self, spike_rates: Dict[str, float]) -> Dict[str, float]:
+        data_cfg = self.config.get('data', {})
+        model_cfg = self.config.get('model', {})
+        volume_shape = tuple(int(x) for x in data_cfg.get('resample_size', [128, 128, 128]))
+        return compute_energy_estimate(
+            spike_rates,
+            volume_shape=volume_shape,
+            encoder_channels=model_cfg.get('encoder_channels'),
+            decoder_channels=model_cfg.get('decoder_channels'),
+            time_steps=self._time_steps_from_config(),
+        )
     
     def _setup_multi_gpu(self):
         """Setup multi-GPU environment"""
@@ -448,6 +478,8 @@ class SpikeRegTrainer:
         train_loss_component_count: int = 0
         displacement_mean_norms = []
         displacement_max_norms = []
+        spike_rate_sums: Dict[str, float] = defaultdict(float)
+        spike_rate_count = 0
         
         for batch_idx, batch in enumerate(progress_bar):
                     # Get data
@@ -475,6 +507,11 @@ class SpikeRegTrainer:
                         displacement = output['displacement']
                         warped = self.spatial_transformer(moving, displacement)
                         spike_counts = output.get('spike_counts', {})
+                        spike_rates = self._spike_rates_to_floats(spike_counts)
+                        for layer_name, rate in spike_rates.items():
+                            spike_rate_sums[layer_name] += rate
+                        if spike_rates:
+                            spike_rate_count += 1
 
                         if torch.isnan(displacement).any() or torch.isnan(warped).any():
                             with open(self.log_file, 'a') as f:
@@ -536,6 +573,18 @@ class SpikeRegTrainer:
         if displacement_mean_norms:
             epoch_metrics['displacement_mean_norm'] = float(np.mean(displacement_mean_norms))
             epoch_metrics['displacement_max_norm'] = float(np.max(displacement_max_norms))
+        if spike_rate_count > 0:
+            mean_rates = {
+                layer_name: total / spike_rate_count
+                for layer_name, total in sorted(spike_rate_sums.items())
+            }
+            for layer_name, rate in mean_rates.items():
+                epoch_metrics[f'spike_rate_{layer_name}'] = float(rate)
+            energy = self._energy_from_spike_rates(mean_rates)
+            epoch_metrics['mean_spike_rate'] = float(energy['mean_spike_rate'])
+            epoch_metrics['energy_ratio_snn_over_ann'] = float(energy['energy_ratio_snn_over_ann'])
+            epoch_metrics['energy_reduction_factor'] = float(energy['energy_reduction_factor'])
+            epoch_metrics['snn_acs_G'] = float(energy['snn_acs_G'])
         
         with open(self.log_file, 'a') as f:
             f.write(f"Completed training epoch {self.epoch}\n")
@@ -567,6 +616,8 @@ class SpikeRegTrainer:
         val_loss_component_count: int = 0
         displacement_mean_norms = []
         displacement_max_norms = []
+        spike_rate_sums: Dict[str, float] = defaultdict(float)
+        spike_rate_count = 0
         dataset = getattr(val_loader, "dataset", None)
         if isinstance(dataset, Subset):
             dataset = dataset.dataset
@@ -593,6 +644,11 @@ class SpikeRegTrainer:
                 displacement = output['displacement']
                 warped = self.spatial_transformer(moving, displacement)
                 spike_counts_val = output.get('spike_counts', {})
+                spike_rates = self._spike_rates_to_floats(spike_counts_val)
+                for layer_name, rate in spike_rates.items():
+                    spike_rate_sums[layer_name] += rate
+                if spike_rates:
+                    spike_rate_count += 1
 
                 if torch.isnan(displacement).any() or torch.isnan(warped).any():
                     with open(self.log_file, 'a') as f:
@@ -636,6 +692,18 @@ class SpikeRegTrainer:
             'val_displacement_mean_norm': float(np.mean(displacement_mean_norms)) if displacement_mean_norms else 0.0,
             'val_displacement_max_norm': float(np.max(displacement_max_norms)) if displacement_max_norms else 0.0,
         }
+        if spike_rate_count > 0:
+            mean_rates = {
+                layer_name: total / spike_rate_count
+                for layer_name, total in sorted(spike_rate_sums.items())
+            }
+            for layer_name, rate in mean_rates.items():
+                metrics[f'val_spike_rate_{layer_name}'] = float(rate)
+            energy = self._energy_from_spike_rates(mean_rates)
+            metrics['val_mean_spike_rate'] = float(energy['mean_spike_rate'])
+            metrics['val_energy_ratio_snn_over_ann'] = float(energy['energy_ratio_snn_over_ann'])
+            metrics['val_energy_reduction_factor'] = float(energy['energy_reduction_factor'])
+            metrics['val_snn_acs_G'] = float(energy['snn_acs_G'])
 
         if val_loss_component_count > 0:
             for comp_name, comp_sum in val_loss_component_sums.items():
@@ -745,11 +813,13 @@ class SpikeRegTrainer:
             base_model = self.pretrained_model.module
 
         # Convert model with optional calibration
+        conversion_config = self.config.get('conversion', {})
+        calibration_for_conversion = None if conversion_config.get('skip_calibration', False) else calibration_loader
         self.spiking_model = convert_pretrained_to_spiking(
             base_model,
             self.config['model'],
-            threshold_percentile=self.config['conversion'].get('threshold_percentile', 99.0),
-            calibration_loader=calibration_loader,
+            threshold_percentile=conversion_config.get('threshold_percentile', 99.0),
+            calibration_loader=calibration_for_conversion,
         ).to(self.device)
 
         # Wrap for multi-GPU if enabled

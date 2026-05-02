@@ -39,3 +39,10 @@ bash launch_spikereg_training.sh --start_from_checkpoint /path/to/checkpoint.pth
 # e.g. drop back to 2 nodes for a quick test
 #SBATCH --nodes=2 is in train_spikereg.sh
 ```
+
+
+abblations:
+scripts/run_spikereg_paper_suite.sh --mode evaluate-submit
+scripts/run_spikereg_paper_suite.sh --mode ablate
+scripts/run_spikereg_paper_suite.sh --mode ablate --submit
+

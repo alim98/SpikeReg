@@ -108,6 +108,29 @@ class DiffeomorphicTransformer(nn.Module):
         self.scaling_steps = scaling_steps
         self.transformer = SpatialTransformer(mode, padding_mode)
     
+    def integrate(self, velocity: torch.Tensor) -> torch.Tensor:
+        """
+        Integrate a stationary velocity field with scaling and squaring.
+
+        Args:
+            velocity: Velocity field [B, 3, D, H, W]
+
+        Returns:
+            displacement: Final displacement field
+        """
+        # Scale velocity field
+        v = velocity / (2 ** self.scaling_steps)
+        
+        # Initialize displacement as velocity
+        displacement = v.clone()
+        
+        # Scaling and squaring
+        for _ in range(self.scaling_steps):
+            # Compose displacement with itself
+            displacement = displacement + self.transformer(displacement, displacement)
+
+        return displacement
+
     def forward(
         self, 
         src: torch.Tensor, 
@@ -124,16 +147,7 @@ class DiffeomorphicTransformer(nn.Module):
             warped: Warped image
             displacement: Final displacement field
         """
-        # Scale velocity field
-        v = velocity / (2 ** self.scaling_steps)
-        
-        # Initialize displacement as velocity
-        displacement = v.clone()
-        
-        # Scaling and squaring
-        for _ in range(self.scaling_steps):
-            # Compose displacement with itself
-            displacement = displacement + self.transformer(displacement, displacement)
+        displacement = self.integrate(velocity)
         
         # Apply final transformation
         warped = self.transformer(src, displacement)

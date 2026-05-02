@@ -1,0 +1,66 @@
+\section{Introduction}
+\label{sec:introduction}
+
+% ---------------------------------------------------------
+% Hidden subsection 1:
+% Registration is dense geometric correspondence, not classification.
+% Goal: establish why the task is clinically and computationally important.
+% ---------------------------------------------------------
+
+Deformable medical image registration aims to estimate a spatial transformation that aligns anatomical structures across images. In brain MRI, this operation is central to atlas propagation, anatomical correspondence analysis, longitudinal monitoring, and population-level morphometry. Unlike image classification, where a network predicts one or a small number of global labels, deformable registration requires a dense three-dimensional transformation field in which each voxel is assigned a spatial correspondence. Consequently, the registration model must preserve local anatomical detail while also capturing long-range spatial relationships between moving and fixed images.
+
+Classical registration algorithms formulate this problem as an optimization over deformation fields, typically combining an image similarity term with spatial regularization. Diffeomorphic methods such as SyN and diffeomorphic Demons further constrain the transformation to improve smoothness and invertibility, making topology preservation a central concern in registration rather than a secondary metric \citep{avants2008syn,vercauteren2009diffeomorphic}. These methods remain important reference points because they explicitly address deformation regularity, but their iterative optimization can be computationally expensive when applied repeatedly across large three-dimensional cohorts.
+
+% ---------------------------------------------------------
+% Hidden subsection 2:
+% Deep registration solved speed, but not energy.
+% Goal: acknowledge VoxelMorph/TransMorph without competing only on Dice.
+% ---------------------------------------------------------
+
+Deep learning has substantially changed this landscape by amortizing registration. Instead of solving a new optimization problem for every image pair, learning-based methods train a network to predict the deformation field directly. VoxelMorph demonstrated that convolutional neural networks can perform unsupervised pairwise deformable registration with accuracy comparable to traditional methods while reducing inference time by orders of magnitude \citep{balakrishnan2019voxelmorph}. Subsequent probabilistic and diffeomorphic variants incorporated uncertainty modeling and stationary velocity-field integration to improve transformation regularity \citep{dalca2019probabilistic}. More recently, transformer-based models such as TransMorph introduced long-range self-attention into volumetric registration, improving the ability to reason over distant anatomical regions and establishing strong performance on brain MRI benchmarks, including OASIS/Learn2Reg \citep{chen2022transmorph}.
+
+Despite these advances, the dominant learning-based registration paradigm remains computationally dense. CNN- and transformer-based registration networks typically evaluate convolution, attention, normalization, and interpolation operations over the full volume, regardless of whether all spatial locations contribute equally to the final deformation. This is especially relevant for three-dimensional medical imaging, where memory and arithmetic cost scale rapidly with spatial resolution. Current benchmarks usually emphasize Dice, Hausdorff distance, target registration error, Jacobian statistics, and runtime \citep{hering2023learn2reg}. However, explicit modeling of sparse computation and energy-aware inference remains comparatively underexplored in deformable registration.
+
+% ---------------------------------------------------------
+% Hidden subsection 3:
+% Why spiking neural networks are relevant but non-trivial.
+% Goal: motivate SNNs without sounding biological or vague.
+% ---------------------------------------------------------
+
+Spiking neural networks (SNNs) provide a different computational substrate. Instead of propagating dense real-valued activations at every layer, SNNs communicate through sparse binary events over time. This event-driven representation is attractive for low-power inference because inactive neurons can avoid unnecessary synaptic operations, especially on neuromorphic hardware designed for sparse asynchronous computation \citep{davies2018loihi,davies2021loihi}. In conventional artificial neural networks, convolutional layers are dominated by multiply--accumulate operations. In spiking networks, many synaptic updates can be implemented as conditional accumulate operations triggered only by spikes, making the effective cost dependent on measured spike activity rather than only on network size \citep{horowitz2014energy,rueckauer2017conversion}.
+
+However, applying SNNs to deformable image registration is not a direct extension of existing SNN applications. Much of the successful ANN-to-SNN conversion literature focuses on image classification, where the final prediction is low-dimensional and errors can be averaged over output classes \citep{diehl2015fast,rueckauer2017conversion}. Medical image applications of SNNs have begun to consider segmentation and neuroimaging tasks, including U-Net-like SNNs and SNN fine-tuning pipelines for brain MRI segmentation \citep{patel2021spikingseg,yue2023snnseg}. Yet dense deformable registration is more demanding: the output is continuous, high-dimensional, spatially coupled, and directly tied to deformation topology. A small local error in the displacement field can reduce anatomical overlap, introduce unrealistic local distortion, or produce non-positive Jacobian determinants. Therefore, the central question is not simply whether a spiking network can process medical images, but whether sparse temporal spikes can support accurate and smooth dense geometric regression.
+
+% ---------------------------------------------------------
+% Hidden subsection 4:
+% Define the gap.
+% Goal: make the missing piece very precise.
+% ---------------------------------------------------------
+
+This gap motivates the present work. To our knowledge, no prior study has systematically examined spiking neural networks for three-dimensional deformable medical image registration under a registration-specific evaluation protocol. Existing registration methods provide strong accuracy and topology baselines, while existing SNN methods provide conversion, surrogate-gradient training, and energy-efficient inference mechanisms. What is missing is a framework that connects these two lines of work: a spiking model that predicts dense three-dimensional deformation fields, is trained with registration losses, is initialized from an ANN registration teacher, and is evaluated not only by anatomical alignment but also by deformation regularity and spike-dependent computational cost.
+
+% ---------------------------------------------------------
+% Hidden subsection 5:
+% Introduce SpikeReg as the solution.
+% Goal: present the method clearly and defensibly.
+% ---------------------------------------------------------
+
+We introduce \textit{SpikeReg}, a spiking neural framework for energy-aware deformable medical image registration. SpikeReg follows an ANN-to-SNN training strategy tailored to dense geometric prediction. First, an ANN U-Net registration model is trained to learn stable spatial features and displacement prediction. The ANN is then converted into a spiking U-Net by transferring convolutional and normalization parameters and calibrating layer-wise firing thresholds from ANN activation statistics. The resulting SNN is fine-tuned with surrogate gradients, allowing the network to adapt its temporal spike dynamics to the registration objective. During training, continuous image intensities are injected as input current rather than stochastic Poisson spike trains, preserving gradient stability while allowing spike-based computation in the hidden layers. The model outputs a dense three-channel displacement field and records layer-wise spike activity, enabling direct analysis of the relationship between spike sparsity, registration accuracy, and estimated arithmetic energy.
+
+The training objective combines image similarity, deformation regularization, teacher distillation, and spike regularization. For mono-modal brain MRI registration, local normalized cross-correlation is used as the image similarity term, while diffusion regularization encourages smooth displacement fields. Distillation from the ANN teacher constrains the SNN toward a stable geometric solution after conversion, and spike-rate regularization discourages excessive firing while avoiding silent layers. This design reflects a key property of the task: in deformable registration, energy reduction cannot be pursued independently of deformation quality. Excessive sparsity may under-drive the displacement field, whereas uncontrolled firing may remove the computational advantage of the SNN. SpikeReg therefore treats spike activity as an explicit part of the registration trade-off rather than as an implementation detail.
+
+% ---------------------------------------------------------
+% Hidden subsection 6:
+% Define evaluation philosophy.
+% Goal: make clear that the paper is not about beating TransMorph only.
+% ---------------------------------------------------------
+
+We evaluate SpikeReg using a registration-specific protocol on OASIS/Learn2Reg-style inter-subject brain MRI registration. The primary anatomical accuracy metric is mean label-wise Dice after propagating moving anatomical labels to the fixed image. Surface accuracy is assessed using the 95th percentile Hausdorff distance, image alignment using normalized cross-correlation, and deformation quality using the fraction of voxels with non-positive Jacobian determinant. In addition, we report spike activity, accumulate operation counts, multiply--accumulate baselines, and analytical energy proxies derived from measured firing rates. This evaluation is designed to answer a different question from conventional state-of-the-art registration papers. The objective is not only to maximize Dice, but to characterize whether dense 3D registration can be performed under sparse event-driven computation while retaining most of the accuracy of its ANN counterpart.
+
+% ---------------------------------------------------------
+% Hidden subsection 7:
+% Contributions.
+% Goal: state exactly what is novel and defensible.
+% ---------------------------------------------------------
+
+Our contributions are fourfold. First, we formulate three-dimensional deformable medical image registration as a dense spiking regression problem and present, to our knowledge, the first systematic framework for SNN-based 3D deformable registration. Second, we develop an ANN-to-SNN conversion and fine-tuning pipeline for geometric prediction, combining ANN warm-starting, threshold calibration, surrogate-gradient optimization, and teacher distillation. Third, we introduce a spike-aware registration objective that jointly optimizes anatomical alignment, deformation smoothness, and sparse temporal activity. Fourth, we provide an accuracy--topology--energy evaluation protocol that reports registration metrics together with measured spike rates and analytical operation-count-based energy estimates. Together, these contributions shift the focus from purely accuracy-driven registration toward energy-aware dense geometric modeling, opening a path toward neuromorphic and low-power medical image registration.

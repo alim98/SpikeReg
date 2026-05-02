@@ -1,0 +1,289 @@
+\section{Method}
+\label{sec:method}
+
+% ============================================================
+% Hidden subsection: Method overview and notation
+% ============================================================
+
+We propose \emph{SpikeReg}, a spiking neural network framework for unsupervised 3D deformable medical image registration. Given a fixed image $F:\Omega \rightarrow \mathbb{R}$ and a moving image $M:\Omega \rightarrow \mathbb{R}$ defined on a 3D voxel lattice $\Omega \subset \mathbb{R}^{3}$, the goal is to estimate a dense transformation $\phi:\Omega \rightarrow \Omega$ that aligns $M$ to $F$. In the direct-displacement formulation, the transformation is parameterized as
+\begin{equation}
+    \phi(x) = x + u(x),
+\end{equation}
+where $u:\Omega \rightarrow \mathbb{R}^{3}$ is a voxel-wise displacement field predicted by the network. The warped moving image is obtained by differentiable spatial sampling,
+\begin{equation}
+    M_{\phi}(x) = M(\phi(x)),
+\end{equation}
+following the spatial transformer formulation commonly used in learning-based registration \citep{jaderberg2015spatial,balakrishnan2019voxelmorph,dalca2018diffeomorphic}. Unlike standard convolutional registration networks, SpikeReg replaces the dense activation pathway with temporally sparse spiking computation while preserving the U-Net-like encoder--decoder structure required for dense 3D prediction.
+
+% ============================================================
+% Hidden subsection: Registration network
+% ============================================================
+
+SpikeReg receives the fixed and moving images as a two-channel input,
+\begin{equation}
+    X = [F, M] \in \mathbb{R}^{2 \times D \times H \times W},
+\end{equation}
+and predicts a 3-channel deformation field,
+\begin{equation}
+    \hat{u} = G_{\theta}^{\mathrm{SNN}}(F,M) \in \mathbb{R}^{3 \times D \times H \times W}.
+\end{equation}
+The architecture follows a 3D U-Net design with a four-level encoder, bottleneck, symmetric decoder, and skip connections. The encoder progressively reduces spatial resolution while increasing channel width; the decoder restores spatial resolution and combines high-resolution encoder features through skip connections. In our default configuration, the encoder channel widths are $[16,32,64,128]$ and the decoder channel widths are $[64,32,16,16]$. The final projection head maps the decoder spike train to a continuous displacement field. This design preserves the inductive bias of convolutional registration models such as VoxelMorph \citep{balakrishnan2019voxelmorph}, while replacing intermediate analog activations with spiking state dynamics.
+
+Each spiking convolutional block consists of a 3D convolution, batch normalization, and a leaky integrate-and-fire (LIF) nonlinearity. Let $I_{\ell,t}$ denote the input current to layer $\ell$ at timestep $t$. The LIF membrane state $v_{\ell,t}$ evolves as
+\begin{equation}
+    v_{\ell,t} = \tau_{\ell} v_{\ell,t-1} + I_{\ell,t},
+\end{equation}
+where $\tau_{\ell} \in (0,1)$ is the membrane leak factor. A binary spike is emitted when the membrane crosses a threshold $\vartheta_{\ell}$:
+\begin{equation}
+    s_{\ell,t} = H(v_{\ell,t} - \vartheta_{\ell}),
+\end{equation}
+where $H(\cdot)$ is the Heaviside step function. After a spike, the membrane is reset according to
+\begin{equation}
+    v_{\ell,t} \leftarrow v_{\ell,t}(1-s_{\ell,t}) + v_{\mathrm{reset}}s_{\ell,t}.
+\end{equation}
+Because the hard threshold is non-differentiable, gradients are estimated using a surrogate derivative during backpropagation through time, following standard surrogate-gradient SNN training \citep{zenke2018superspike,neftci2019surrogate}. In practice, the forward pass remains binary and event-driven, while the backward pass uses a smooth approximation around the firing threshold.
+
+% ============================================================
+% Hidden subsection: Temporal rate representation
+% ============================================================
+
+For dense registration, the network must output a continuous displacement field even though its hidden representation is spiking. SpikeReg therefore converts spike trains into rate features between blocks. For layer $\ell$ with $T_{\ell}$ timesteps, the rate representation is
+\begin{equation}
+    r_{\ell} = \frac{1}{T_{\ell}} \sum_{t=1}^{T_{\ell}} s_{\ell,t}.
+\end{equation}
+These rate features are passed to the next convolutional block and to the decoder skip pathways. The final output head receives the decoder spike sequence and predicts a real-valued 3D displacement. This rate-based interface allows the model to retain continuous geometric precision while still measuring and regularizing sparse spike activity.
+
+During GPU training, the image intensities are injected directly as continuous input currents rather than first being converted to stochastic Poisson spike trains. This avoids adding unnecessary sampling noise to the already difficult dense regression objective. Poisson rate coding is retained only as an optional inference-time input encoding for neuromorphic deployment. This separation follows the practical distinction between training-time surrogate-gradient optimization and hardware-oriented event encoding \citep{rueckauer2017conversion,neftci2019surrogate}.
+
+% ============================================================
+% Hidden subsection: ANN warm-start
+% ============================================================
+
+Training a spiking network directly for dense 3D deformation regression is unstable because registration requires smooth, high-precision voxel-wise outputs. We therefore use an ANN warm-start. First, we train an analog U-Net $G_{\psi}^{\mathrm{ANN}}$ with the same macro-architecture as SpikeReg, replacing LIF neurons with ReLU activations. The ANN predicts a displacement field
+\begin{equation}
+    \hat{u}^{\mathrm{ANN}} = G_{\psi}^{\mathrm{ANN}}(F,M),
+\end{equation}
+which is used to warp the moving image. The ANN is trained with the same unsupervised registration objective used in the SNN stage, but without the spike regularization term:
+\begin{equation}
+    \mathcal{L}_{\mathrm{ANN}}
+    =
+    \lambda_{\mathrm{sim}}\mathcal{L}_{\mathrm{sim}}(F,M_{\phi})
+    +
+    \lambda_{\mathrm{reg}}\mathcal{L}_{\mathrm{reg}}(\hat{u}^{\mathrm{ANN}}).
+\end{equation}
+This warm-start stage learns spatial correspondence and deformation priors using conventional backpropagation before the model is converted to an event-driven representation.
+
+% ============================================================
+% Hidden subsection: ANN-to-SNN conversion and threshold calibration
+% ============================================================
+
+After ANN pretraining, the learned convolutional and batch-normalization parameters are transferred layer-by-layer to the corresponding spiking encoder, bottleneck, and decoder blocks. This follows the ANN-to-SNN conversion principle that the firing rate of a spiking neuron should approximate the analog activation of its ANN counterpart \citep{diehl2015fast,rueckauer2017conversion}. For each converted layer $\ell$, we estimate a firing threshold from calibration activations. Given positive ANN activations $\mathcal{A}_{\ell}$ collected on a calibration subset, the threshold is set to the $p$-th percentile:
+\begin{equation}
+    \vartheta_{\ell}
+    =
+    Q_{p}\left(\{a \in \mathcal{A}_{\ell}: a > 0\}\right),
+\end{equation}
+where $Q_{p}$ denotes the empirical percentile operator. This calibration prevents under-stimulation, where neurons rarely spike, and over-stimulation, where neurons fire at excessively high rates and lose sparsity. The converted SNN is then fine-tuned with surrogate gradients. Batch-normalization layers are frozen during SNN fine-tuning to avoid instability caused by time-dependent spike statistics.
+
+% ============================================================
+% Hidden subsection: Image similarity
+% ============================================================
+
+The registration objective uses local normalized cross-correlation (NCC) as the mono-modal image similarity term. For each local window $\mathcal{W}_{x}$ centered at voxel $x$, the local NCC is
+\begin{equation}
+    \mathrm{NCC}_{x}(F,M_{\phi})
+    =
+    \frac{
+    \sum_{y \in \mathcal{W}_{x}}
+    \left(F(y)-\bar{F}_{x}\right)
+    \left(M_{\phi}(y)-\bar{M}_{\phi,x}\right)
+    }{
+    \sqrt{
+    \sum_{y \in \mathcal{W}_{x}}
+    \left(F(y)-\bar{F}_{x}\right)^2
+    }
+    \sqrt{
+    \sum_{y \in \mathcal{W}_{x}}
+    \left(M_{\phi}(y)-\bar{M}_{\phi,x}\right)^2
+    }
+    + \epsilon
+    },
+\end{equation}
+where $\bar{F}_{x}$ and $\bar{M}_{\phi,x}$ are local means. The similarity loss minimizes negative local NCC:
+\begin{equation}
+    \mathcal{L}_{\mathrm{sim}}(F,M_{\phi})
+    =
+    -
+    \frac{1}{|\Omega|}
+    \sum_{x \in \Omega}
+    \mathrm{NCC}_{x}(F,M_{\phi}).
+\end{equation}
+NCC is preferred over mean-squared error because inter-subject brain MR registration can contain intensity differences that should not be penalized as geometric error.
+
+% ============================================================
+% Hidden subsection: Deformation regularization
+% ============================================================
+
+To encourage spatially smooth deformation fields, we apply diffusion regularization to the predicted displacement:
+\begin{equation}
+    \mathcal{L}_{\mathrm{reg}}(u)
+    =
+    \frac{1}{|\Omega|}
+    \sum_{x \in \Omega}
+    \|\nabla u(x)\|_{2}^{2}.
+\end{equation}
+This term penalizes first-order spatial variation in the displacement field and reduces local discontinuities. For ablations, the same framework can also use bending-energy regularization,
+\begin{equation}
+    \mathcal{L}_{\mathrm{bend}}(u)
+    =
+    \frac{1}{|\Omega|}
+    \sum_{x \in \Omega}
+    \sum_{i,j}
+    \left(
+    \frac{\partial^{2}u(x)}{\partial x_i \partial x_j}
+    \right)^2,
+\end{equation}
+which penalizes second-order deformation curvature. The reported main model uses diffusion regularization unless otherwise stated.
+
+% ============================================================
+% Hidden subsection: Spike-aware fine-tuning objective
+% ============================================================
+
+During SNN fine-tuning, the registration loss is augmented with spike sparsity and ANN-teacher distillation:
+\begin{equation}
+    \mathcal{L}_{\mathrm{SNN}}
+    =
+    \lambda_{\mathrm{sim}}\mathcal{L}_{\mathrm{sim}}(F,M_{\phi})
+    +
+    \lambda_{\mathrm{reg}}\mathcal{L}_{\mathrm{reg}}(\hat{u}^{\mathrm{SNN}})
+    +
+    \lambda_{\mathrm{spk}}\mathcal{L}_{\mathrm{spk}}
+    +
+    \lambda_{\mathrm{dist}}\mathcal{L}_{\mathrm{dist}}.
+\end{equation}
+The spike regularization term controls the accuracy--efficiency trade-off. Let $\rho_{\ell}$ be the mean spike rate of layer $\ell$:
+\begin{equation}
+    \rho_{\ell}
+    =
+    \frac{1}{T_{\ell}N_{\ell}}
+    \sum_{t=1}^{T_{\ell}}
+    \sum_{i=1}^{N_{\ell}}
+    s_{\ell,t,i},
+\end{equation}
+where $N_{\ell}$ is the number of neurons in layer $\ell$. We define
+\begin{equation}
+    \mathcal{L}_{\mathrm{spk}}
+    =
+    \sum_{\ell}
+    \rho_{\ell}
+    +
+    \beta
+    \sum_{\ell}
+    (\rho_{\ell}-\rho^{\star})^{2},
+\end{equation}
+where $\rho^{\star}$ is the target spike rate and $\beta$ controls layer-wise rate balancing. The first term discourages excessive firing, while the second prevents degenerate solutions in which some layers become silent and others overactive.
+
+The distillation term keeps the SNN deformation close to the ANN teacher:
+\begin{equation}
+    \mathcal{L}_{\mathrm{dist}}
+    =
+    \left\|
+    \hat{u}^{\mathrm{SNN}}
+    -
+    \hat{u}^{\mathrm{ANN}}
+    \right\|_{2}^{2}.
+\end{equation}
+This term is important because small spike-induced errors can accumulate spatially in dense registration. Distillation therefore stabilizes SNN fine-tuning by preserving the geometric behavior learned during ANN pretraining.
+
+% ============================================================
+% Hidden subsection: Optional topology-constrained variant
+% Remove this paragraph if the final paper only reports direct displacement.
+% ============================================================
+
+For topology-constrained experiments, we also consider a diffeomorphic SpikeReg variant. Instead of predicting a displacement field directly, the network predicts a stationary velocity field $v:\Omega \rightarrow \mathbb{R}^{3}$, which is integrated into a deformation field through scaling and squaring:
+\begin{equation}
+    \phi = \exp(v).
+\end{equation}
+The velocity is first scaled by $2^{-K}$ and then recursively composed:
+\begin{equation}
+    \phi_{0}(x) = x + \frac{v(x)}{2^{K}},
+    \qquad
+    \phi_{k+1} = \phi_{k} \circ \phi_{k},
+    \qquad
+    k=0,\ldots,K-1.
+\end{equation}
+This follows diffeomorphic registration methods that integrate velocity fields to obtain smoother, topology-preserving transformations \citep{dalca2018diffeomorphic,dalca2019probabilistic,chen2022transmorph}. We report this variant separately from the direct-displacement SpikeReg baseline.
+
+% ============================================================
+% Hidden subsection: Analytical operation-count energy proxy
+% ============================================================
+
+To quantify the computational advantage of sparse spiking activity, we estimate arithmetic-operation energy using an analytical MAC/AC proxy. The ANN baseline performs dense multiply--accumulate operations. For layer $\ell$, let $\mathrm{MAC}_{\ell}$ denote the number of dense convolutional operations. The ANN arithmetic energy is approximated as
+\begin{equation}
+    E_{\mathrm{ANN}}
+    =
+    E_{\mathrm{MAC}}
+    \sum_{\ell}
+    \mathrm{MAC}_{\ell}.
+\end{equation}
+For the SNN, only active presynaptic events contribute to accumulation. Using the measured mean spike rate $\rho_{\ell}$ and timestep count $T_{\ell}$, the corresponding accumulate operations are approximated as
+\begin{equation}
+    \mathrm{AC}_{\ell}
+    =
+    T_{\ell}\rho_{\ell}\mathrm{MAC}_{\ell}.
+\end{equation}
+The SNN arithmetic energy proxy is therefore
+\begin{equation}
+    E_{\mathrm{SNN}}
+    =
+    E_{\mathrm{AC}}
+    \sum_{\ell}
+    T_{\ell}\rho_{\ell}\mathrm{MAC}_{\ell}.
+\end{equation}
+The relative arithmetic energy is reported as
+\begin{equation}
+    R_{\mathrm{energy}}
+    =
+    \frac{E_{\mathrm{SNN}}}{E_{\mathrm{ANN}}}
+    =
+    \frac{
+    E_{\mathrm{AC}}
+    \sum_{\ell} T_{\ell}\rho_{\ell}\mathrm{MAC}_{\ell}
+    }{
+    E_{\mathrm{MAC}}
+    \sum_{\ell}\mathrm{MAC}_{\ell}
+    }.
+\end{equation}
+This metric is reported as an analytical proxy rather than a hardware measurement. It does not include memory movement, routing overhead, hardware scheduling, or device-specific implementation effects. Actual neuromorphic energy claims require deployment and measurement on neuromorphic hardware. Nevertheless, the proxy provides a controlled way to compare dense ANN computation with sparse event-driven computation under identical architecture and input volume assumptions \citep{horowitz2014computing,indiveri2015memory,rueckauer2017conversion}.
+
+% ============================================================
+% Hidden subsection: Training protocol
+% ============================================================
+
+The model is trained in two stages. First, the ANN teacher is trained using the unsupervised registration objective with NCC similarity and deformation regularization. Second, the ANN parameters are converted to the spiking network through layer-wise weight transfer and threshold calibration. The converted SNN is then fine-tuned with the full spike-aware objective. Unless otherwise stated, we use $T=4$ timesteps in each spiking encoder and decoder block, direct-current input injection during training, Adam optimization, gradient clipping, and full-volume training. The default OASIS/Learn2Reg configuration uses full-resolution volumes of size $160 \times 192 \times 224$, a target spike rate of $0.1$, NCC window size $9$, diffusion regularization, and ANN-teacher distillation during SNN fine-tuning.
+
+% ============================================================
+% Hidden subsection: Evaluation quantities used by the method
+% ============================================================
+
+Although anatomical overlap metrics are reported in the experimental section, the method explicitly records both deformation and spiking quantities during inference. For each image pair, SpikeReg outputs the deformation field, warped moving image, layer-wise spike rates, and layer-wise spike counts. These quantities enable joint evaluation of registration accuracy, deformation regularity, and event sparsity. Deformation regularity is assessed using the Jacobian determinant of $\phi$:
+\begin{equation}
+    J_{\phi}(x)
+    =
+    \det
+    \left(
+    \nabla \phi(x)
+    \right).
+\end{equation}
+The fraction of voxels with non-positive determinant is used to quantify folding:
+\begin{equation}
+    \mathrm{Fold}(\phi)
+    =
+    \frac{1}{|\Omega|}
+    \sum_{x \in \Omega}
+    \mathbbm{1}
+    \left[
+    J_{\phi}(x) \leq 0
+    \right].
+\end{equation}
+This ensures that SpikeReg is evaluated not only as an image-similarity model, but as a geometric registration method whose output must remain spatially meaningful.

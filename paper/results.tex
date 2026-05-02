@@ -1,0 +1,346 @@
+\section{Results}
+
+% ============================================================
+% Hidden subsection: Result narrative and evaluation principle
+% ============================================================
+
+We evaluate SpikeReg around three linked questions: 
+(i) whether sparse spiking computation can perform dense 3D deformable registration without collapse, 
+(ii) how much registration accuracy is retained after ANN-to-SNN conversion, and 
+(iii) whether the resulting model provides a measurable accuracy--topology--energy trade-off. 
+The central comparison is therefore not only between SpikeReg and conventional registration baselines, but also between SpikeReg and its own ANN teacher, since the latter isolates the effect of replacing dense artificial activations with sparse temporal spiking dynamics.
+
+All quantitative results are reported on the OASIS/Learn2Reg validation protocol using full-volume image pairs. Unless otherwise stated, Dice is computed after warping the moving anatomical segmentation to the fixed image space and averaging over anatomical labels. Deformation quality is measured using the fraction of voxels with non-positive Jacobian determinant, and surface accuracy is measured using HD95. Energy efficiency is reported using spike-rate-derived operation counts and analytical energy proxies; these values should be interpreted as hardware-independent estimates unless measured directly on neuromorphic hardware.
+
+% ============================================================
+% Hidden subsection: Main performance summary
+% ============================================================
+
+\paragraph{SpikeReg retains most of the ANN teacher accuracy.}
+Table~\ref{tab:main_results} summarizes the main registration results. The ANN warm-start model reached a best validation Dice of $0.7460$ and a final Dice of $0.7458$, establishing the non-spiking upper bound for the current architecture. After ANN-to-SNN conversion and surrogate-gradient fine-tuning, SpikeReg reached a best validation Dice of $0.7346$ and a final Dice of $0.7339$. This corresponds to an absolute Dice drop of $0.0114$ relative to the best ANN checkpoint, or approximately $98.5\%$ retention of the ANN teacher performance.
+
+This result is important because deformable registration is a dense continuous prediction task: the network must predict a spatially coherent 3D displacement field, not a single class label. The small ANN-to-SNN performance gap suggests that the learned registration function is largely preserved after conversion to sparse temporal spiking dynamics.
+
+\begin{table}[t]
+\centering
+\caption{
+Main registration performance on OASIS/Learn2Reg validation pairs. 
+Values marked with \textbf{[RESULT-TODO]} require full-volume re-evaluation using the final frozen checkpoints.
+}
+\label{tab:main_results}
+\begin{tabular}{lcccccc}
+\hline
+Method & Dice $\uparrow$ & HD95 $\downarrow$ & NCC $\uparrow$ & Neg. Jac. $\downarrow$ & Params & Energy \\
+\hline
+ANTs/SyN & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & -- & \textbf{[RESULT-TODO]} & -- & -- \\
+VoxelMorph & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & 1.00$\times$ \\
+VoxelMorph-diff & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & 1.00$\times$ \\
+TransMorph & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & 1.00$\times$ \\
+\hline
+ANN teacher & 0.7460 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & 1.00$\times$ \\
+SpikeReg, $T=4$ & 0.7346 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & 0.0152 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+SpikeReg-SVF, $T=4$ & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+\hline
+\end{tabular}
+\end{table}
+
+% ============================================================
+% Hidden subsection: Accuracy retention after ANN-to-SNN conversion
+% ============================================================
+
+\paragraph{The main empirical signal is accuracy retention, not state-of-the-art Dice.}
+The current SpikeReg model does not aim to outperform the strongest transformer-based registration networks in absolute Dice. Instead, the relevant result is that the SNN retains nearly all of the accuracy of the ANN teacher while replacing dense activations with sparse spike events. The best ANN checkpoint achieved $0.7460$ Dice, whereas the best SNN checkpoint achieved $0.7346$ Dice. The absolute degradation is therefore $0.0114$ Dice points.
+
+\begin{equation}
+\mathrm{Retention}
+=
+\frac{\mathrm{Dice}_{\mathrm{SNN}}}{\mathrm{Dice}_{\mathrm{ANN}}}
+=
+\frac{0.7346}{0.7460}
+=
+0.985.
+\end{equation}
+
+This $98.5\%$ retention is the strongest current result of the paper. It shows that ANN-to-SNN conversion is a viable initialization strategy for dense 3D registration, where naive SNN training is expected to be unstable because the output space is continuous, high-dimensional, and topology-sensitive.
+
+% ============================================================
+% Hidden subsection: Deformation topology and current weakness
+% ============================================================
+
+\paragraph{Topology remains the main current weakness.}
+Although SpikeReg retains most of the ANN teacher accuracy, the current best SNN checkpoint has a non-positive Jacobian fraction of $0.0152$, corresponding to approximately $1.52\%$ folding. This is acceptable for an early non-diffeomorphic prototype but is not yet strong enough for a high-impact registration paper. A model that achieves good Dice by producing folded or locally non-invertible deformations is less convincing, especially when compared against diffeomorphic baselines.
+
+Therefore, the current direct-displacement SpikeReg result should be reported as a strong accuracy-retention baseline, while the final manuscript should include a topology-aware variant. The preferred variant is SpikeReg-SVF, where the network predicts a stationary velocity field that is integrated by scaling and squaring before warping. This experiment is not yet complete and should be treated as a required result before submission.
+
+\begin{table}[t]
+\centering
+\caption{
+Topology and deformation regularity. 
+The current direct-displacement SNN has promising Dice retention but still excessive folding for a strong registration paper.
+}
+\label{tab:topology}
+\begin{tabular}{lcccc}
+\hline
+Method & Dice $\uparrow$ & Neg. Jac. $\downarrow$ & SDlogJ $\downarrow$ & Mean disp. norm \\
+\hline
+ANN teacher & 0.7460 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+SpikeReg, direct displacement & 0.7346 & 0.0152 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+SpikeReg-SVF & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO: target $<0.005$]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{[CURRENTLY WEAK:]} The direct SNN folding rate of $1.52\%$ should not be presented as final topology quality. The paper needs either a stronger Jacobian penalty, lower displacement scale, SVF integration, or explicit comparison showing that the folding is not worse than comparable non-diffeomorphic baselines.
+
+% ============================================================
+% Hidden subsection: Energy and sparse activity
+% ============================================================
+
+\paragraph{Spike activity must explain the efficiency claim.}
+The key motivation for SpikeReg is not only registration accuracy, but sparse event-driven computation. Therefore, the results must show measured spike rates and operation-count-derived energy estimates. The current training logs include spike-related losses, but the final benchmark must explicitly report layer-wise spike rates, total spike counts, AC operations, MAC operations, and estimated energy ratio.
+
+Table~\ref{tab:energy} is the core efficiency table required for the final paper. This table should be generated for the same checkpoints used in Table~\ref{tab:main_results}; otherwise, the accuracy and energy claims will not be directly comparable.
+
+\begin{table}[t]
+\centering
+\caption{
+Spike activity and analytical energy estimates. 
+Energy values are analytical proxies computed from measured spike rates and operation counts, not direct neuromorphic hardware measurements.
+}
+\label{tab:energy}
+\begin{tabular}{lccccc}
+\hline
+Method & Time steps & Mean spike rate & AC ops & MAC ops & Est. energy ratio $\downarrow$ \\
+\hline
+ANN teacher & -- & -- & -- & \textbf{[RESULT-TODO]} & 1.00$\times$ \\
+SpikeReg & 2 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & -- & \textbf{[RESULT-TODO]} \\
+SpikeReg & 4 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & -- & \textbf{[RESULT-TODO]} \\
+SpikeReg & 8 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & -- & \textbf{[RESULT-TODO]} \\
+SpikeReg-SVF & 4 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & -- & \textbf{[RESULT-TODO]} \\
+\hline
+\end{tabular}
+\end{table}
+
+\textbf{[RESULT-TODO:]} Run the final evaluator with spike-rate logging enabled. Report mean spike rate globally and per layer. The paper should not claim energy reduction until this table is complete.
+
+% ============================================================
+% Hidden subsection: Accuracy-energy Pareto analysis
+% ============================================================
+
+\paragraph{SpikeReg exposes a controllable accuracy--energy trade-off.}
+The most important SNN-specific result should be an accuracy--energy Pareto curve. We vary the number of time steps and firing-threshold calibration percentile, then measure Dice, topology, spike rate, and estimated energy. This experiment determines whether SpikeReg is merely a lower-accuracy ANN approximation or a genuinely controllable sparse registration model.
+
+\begin{table}[t]
+\centering
+\caption{
+Accuracy--energy trade-off under different temporal budgets and threshold calibration settings.
+}
+\label{tab:pareto}
+\begin{tabular}{cccccc}
+\hline
+$T$ & Threshold percentile & Dice $\uparrow$ & Neg. Jac. $\downarrow$ & Mean spike rate $\downarrow$ & Energy ratio $\downarrow$ \\
+\hline
+1 & 50.0 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+2 & 50.0 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+4 & 50.0 & 0.7346 & 0.0152 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+8 & 50.0 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+\hline
+4 & 75.0 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+4 & 90.0 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+4 & 95.0 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+4 & 99.5 & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+\hline
+\end{tabular}
+\end{table}
+
+The expected pattern is that increasing $T$ improves deformation expressivity and Dice but increases spike operations, whereas increasing the threshold percentile should reduce spike activity but may under-drive the displacement field. The final paper should report the Pareto frontier rather than selecting a single arbitrary operating point.
+
+\textbf{[RESULT-TODO:]} Generate Figure~\ref{fig:pareto}: Dice versus estimated energy ratio, with point size or color indicating negative Jacobian fraction.
+
+% ============================================================
+% Hidden subsection: Temporal integration
+% ============================================================
+
+\paragraph{Temporal spiking dynamics act as an implicit refinement mechanism.}
+Unlike a standard ANN, SpikeReg computes registration through temporal membrane integration. To test whether time steps provide useful geometric refinement, we evaluate the same model under different temporal budgets. This experiment should quantify how Dice, NCC, displacement magnitude, and spike rate evolve as $T$ increases.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.85\linewidth}{
+\centering
+\textbf{[FIGURE-TODO]} Accuracy and energy as a function of SNN time steps. 
+Plot Dice, NCC, displacement norm, spike rate, and energy ratio for $T \in \{1,2,4,8\}$.
+}}
+\caption{
+Temporal integration analysis. 
+A useful SpikeReg model should show improved alignment with increasing time steps, but with diminishing returns after a small temporal budget.
+}
+\label{fig:temporal}
+\end{figure}
+
+\textbf{[RESULT-TODO:]} This analysis is required because time steps are the main computational degree of freedom in the SNN. Without this experiment, the choice of $T=4$ appears arbitrary.
+
+% ============================================================
+% Hidden subsection: Ablation study
+% ============================================================
+
+\paragraph{Calibration, distillation, and spike regularization are necessary for stable dense spiking registration.}
+We ablate the components that are specific to SpikeReg: ANN warm-start, threshold calibration, spike regularization, and displacement distillation from the ANN teacher. The goal is to show that the final model is not simply a direct SNN trained by chance, but the result of a necessary conversion-and-fine-tuning protocol.
+
+\begin{table}[t]
+\centering
+\caption{
+Ablation study of the SpikeReg training pipeline.
+}
+\label{tab:ablation}
+\begin{tabular}{lccccc}
+\hline
+Variant & Dice $\uparrow$ & HD95 $\downarrow$ & Neg. Jac. $\downarrow$ & Spike rate $\downarrow$ & Status \\
+\hline
+SNN trained from scratch & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & Required \\
+ANN-to-SNN, no calibration & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & Required \\
+ANN-to-SNN, calibrated & 0.7346 & \textbf{[RESULT-TODO]} & 0.0152 & \textbf{[RESULT-TODO]} & Available preliminary \\
+No spike regularization & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & Required \\
+No ANN distillation & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & Required \\
+SpikeReg-SVF & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & Strongly recommended \\
+\hline
+\end{tabular}
+\end{table}
+
+The expected failure mode for training from scratch is either under-deformation, unstable displacement prediction, or poor convergence. The expected failure mode without calibration is pathological firing: either excessive spikes, which removes the efficiency advantage, or dead layers, which suppress deformation. The expected failure mode without spike regularization is high spike activity with no clear energy benefit. The expected failure mode without distillation is a larger Dice gap relative to the ANN teacher.
+
+\textbf{[RESULT-TODO:]} This table is mandatory for publication. A reviewer will not accept the conversion pipeline unless the necessity of calibration and distillation is demonstrated.
+
+% ============================================================
+% Hidden subsection: Qualitative registration results
+% ============================================================
+
+\paragraph{Qualitative results show anatomically plausible deformation but must include failure cases.}
+Figure~\ref{fig:qualitative} should show representative axial, coronal, and sagittal slices for fixed, moving, warped moving, absolute difference before registration, absolute difference after registration, displacement magnitude, and Jacobian determinant. The figure should include at least three cases: a successful case, a median case, and a failure case.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.9\linewidth}{
+\centering
+\textbf{[FIGURE-TODO]} Qualitative registration examples. 
+Rows: fixed, moving, warped, before/after difference, displacement magnitude, Jacobian determinant. 
+Columns: successful case, median case, failure case.
+}}
+\caption{
+Qualitative evaluation of SpikeReg registration. 
+The final figure should demonstrate not only image overlap improvement but also deformation smoothness and local topology.
+}
+\label{fig:qualitative}
+\end{figure}
+
+The qualitative analysis should emphasize whether SpikeReg improves anatomical alignment without producing visually implausible local compression or folding. Cases with high Dice but localized folding should be shown explicitly, since they motivate the topology-aware SpikeReg-SVF extension.
+
+% ============================================================
+% Hidden subsection: Layer-wise spike analysis
+% ============================================================
+
+\paragraph{Spike activity is spatially and hierarchically structured.}
+To make the SNN contribution convincing, the final results should include layer-wise spike-rate analysis. Early encoder layers are expected to be more active because they process high-resolution intensity structure, whereas bottleneck and decoder layers should exhibit lower but more semantically concentrated activity. A useful SpikeReg model should avoid two pathological regimes: globally dense firing, which eliminates energy gains, and dead firing, which prevents deformation.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.85\linewidth}{
+\centering
+\textbf{[FIGURE-TODO]} Layer-wise spike rates for encoder, bottleneck, and decoder layers. 
+Include mean and standard deviation across validation pairs.
+}}
+\caption{
+Layer-wise spike activity. 
+This analysis verifies that SpikeReg performs registration using sparse internal activity rather than dense ANN-like firing.
+}
+\label{fig:spike_layers}
+\end{figure}
+
+\textbf{[RESULT-TODO:]} Add layer-wise spike-rate extraction to the evaluation script and report encoder, bottleneck, and decoder spike rates separately.
+
+% ============================================================
+% Hidden subsection: Deformation magnitude and under-registration
+% ============================================================
+
+\paragraph{Spike sparsity controls deformation expressivity.}
+A central hypothesis of SpikeReg is that spike activity is coupled to deformation magnitude. If the spike rate is too low, the model may under-register by predicting small or overly smooth displacement fields. If the spike rate is too high, the model may approach ANN-like performance but lose the energy advantage. We therefore report displacement magnitude statistics together with spike rate and Dice.
+
+\begin{table}[t]
+\centering
+\caption{
+Relationship between spike activity and deformation magnitude.
+}
+\label{tab:spike_deformation}
+\begin{tabular}{lcccc}
+\hline
+Model setting & Mean spike rate & Mean disp. norm & Max disp. norm & Dice \\
+\hline
+Low-spike setting & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+Default SpikeReg & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & 0.7346 \\
+High-spike setting & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} \\
+ANN teacher & -- & \textbf{[RESULT-TODO]} & \textbf{[RESULT-TODO]} & 0.7460 \\
+\hline
+\end{tabular}
+\end{table}
+
+This analysis is important because it gives a mechanistic interpretation of SNN registration: sparse firing is not merely a computational statistic, but directly constrains the geometric capacity of the deformation field.
+
+% ============================================================
+% Hidden subsection: Robustness and statistical reporting
+% ============================================================
+
+\paragraph{Results should be reported with uncertainty across validation pairs.}
+All final tables should include mean and standard deviation across image pairs. For the main comparison, we should additionally report paired statistical tests between the ANN teacher and SpikeReg, since both models are evaluated on the same fixed--moving pairs. The most relevant test is a paired comparison of per-pair Dice and HD95.
+
+\begin{equation}
+\Delta \mathrm{Dice}_i
+=
+\mathrm{Dice}_{i}^{\mathrm{ANN}}
+-
+\mathrm{Dice}_{i}^{\mathrm{SNN}},
+\end{equation}
+
+where $i$ indexes validation pairs. The distribution of $\Delta \mathrm{Dice}$ should be shown as a box plot or violin plot. A narrow distribution centered near $0.01$ would support the claim that SNN conversion causes a small and consistent accuracy loss rather than unstable case-dependent failures.
+
+\textbf{[RESULT-TODO:]} Add paired per-case analysis: Dice difference, HD95 difference, Jacobian difference, and energy difference for each validation pair.
+
+% ============================================================
+% Hidden subsection: Failure analysis
+% ============================================================
+
+\paragraph{Failure cases are dominated by topology and under-deformation.}
+The current results suggest two likely failure modes. First, the SNN can retain high overlap while producing local folding, visible through non-positive Jacobian regions. Second, overly sparse firing may under-drive the displacement field, leading to incomplete alignment in anatomically variable regions.
+
+The final manuscript should identify the worst-performing validation pairs and report whether failures are caused by low spike activity, large anatomical mismatch, excessive displacement magnitude, or local folding. This failure analysis is important because it clarifies whether SpikeReg's remaining limitations are caused by registration difficulty in general or by spiking-specific constraints.
+
+\begin{figure}[t]
+\centering
+\fbox{\parbox{0.85\linewidth}{
+\centering
+\textbf{[FIGURE-TODO]} Failure-case analysis. 
+Show the worst Dice case, worst HD95 case, and highest-folding case.
+}}
+\caption{
+Failure modes of SpikeReg. 
+The final analysis should separate under-registration, local folding, and spike-sparsity-induced deformation suppression.
+}
+\label{fig:failure}
+\end{figure}
+
+% ============================================================
+% Hidden subsection: Result summary
+% ============================================================
+
+\paragraph{Summary of findings.}
+The current experiments show that SpikeReg can perform dense 3D deformable registration after ANN-to-SNN conversion, reaching $0.7346$ Dice compared with $0.7460$ for its ANN teacher. This corresponds to $98.5\%$ accuracy retention and demonstrates that sparse spiking dynamics can approximate a learned 3D registration function. However, the current direct-displacement model still has a non-positive Jacobian fraction of $1.52\%$, and the energy claim remains incomplete until spike-rate-derived operation counts are reported.
+
+The final high-impact version of the paper should therefore make the following result claims only after the missing experiments are completed:
+
+\begin{enumerate}
+    \item SpikeReg retains near-ANN registration accuracy after ANN-to-SNN conversion.
+    \item SpikeReg provides a measurable accuracy--energy Pareto frontier controlled by spike rate, threshold calibration, and temporal budget.
+    \item SpikeReg-SVF reduces folding relative to the direct-displacement SNN while preserving most of the Dice score.
+    \item SpikeReg achieves lower analytical energy than the ANN teacher at a small cost in Dice.
+\end{enumerate}
+
+\textbf{[FINAL CLAIM PLACEHOLDER:]} SpikeReg retains \textbf{[RESULT-TODO: XX\%]} of ANN Dice while reducing estimated arithmetic energy by \textbf{[RESULT-TODO: XX$\times$]} and maintaining a non-positive Jacobian fraction of \textbf{[RESULT-TODO: XX\%]}.

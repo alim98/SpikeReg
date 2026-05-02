@@ -11,6 +11,7 @@ from .layers import (
     OutputProjection, SpikingConv3d
 )
 from .neurons import LIFNeuron
+from .utils.warping import DiffeomorphicTransformer
 
 
 class SpikeRegUNet(nn.Module):
@@ -41,6 +42,13 @@ class SpikeRegUNet(nn.Module):
         
         self.skip_merge = config.get('skip_merge', ['concatenate', 'average', 'concatenate', 'none'])
         self.learnable_neurons = config.get('learnable_neurons', False)
+        self.output_transform = str(config.get('output_transform', 'displacement')).lower()
+        self.svf_scaling_steps = int(config.get('svf_scaling_steps', 7))
+        self.svf_transformer = (
+            DiffeomorphicTransformer(scaling_steps=self.svf_scaling_steps)
+            if self.output_transform in {'svf', 'diffeomorphic', 'velocity'}
+            else None
+        )
         
         self.encoder_blocks = nn.ModuleList()
         in_ch = self.in_channels
@@ -237,8 +245,16 @@ class SpikeRegUNet(nn.Module):
             spike_counts[f'decoder_{i}'] = x.mean()
             spike_counts_number[f'decoder_{i}'] = x.sum().cpu().detach().numpy()
         
-        # Output projection
-        displacement = self.output_projection(x)
+        # Output projection. In SVF mode the head predicts a stationary
+        # velocity field and scaling-and-squaring converts it to displacement.
+        raw_field = self.output_projection(x)
+        velocity = None
+        if self.svf_transformer is not None:
+            velocity = raw_field
+            displacement = self.svf_transformer.integrate(velocity)
+        else:
+            displacement = raw_field
+
         # Check for NaN in displacement
         if torch.isnan(displacement).any():
             print("Warning: NaN detected in displacement output!")
@@ -249,6 +265,8 @@ class SpikeRegUNet(nn.Module):
             'spike_counts': spike_counts,
             'spike_counts_number': spike_counts_number
         }
+        if velocity is not None:
+            output['velocity'] = velocity
         
         if return_features:
             output['encoder_features'] = encoder_features
@@ -287,6 +305,13 @@ class PretrainedUNet(nn.Module):
         self.encoder_channels = config.get('encoder_channels', [16, 32, 64, 128])
         self.decoder_channels = config.get('decoder_channels', [64, 32, 16, 16])
         self.skip_merge = config.get('skip_merge', ['concatenate', 'average', 'concatenate', 'none'])
+        self.output_transform = str(config.get('output_transform', 'displacement')).lower()
+        self.svf_scaling_steps = int(config.get('svf_scaling_steps', 7))
+        self.svf_transformer = (
+            DiffeomorphicTransformer(scaling_steps=self.svf_scaling_steps)
+            if self.output_transform in {'svf', 'diffeomorphic', 'velocity'}
+            else None
+        )
         
         # Encoder
         self.encoders = nn.ModuleList()
@@ -406,8 +431,13 @@ class PretrainedUNet(nn.Module):
             
             x = refine(x)
         
-        # Output
-        displacement = self.output(x)
+        # Output. In SVF mode the head predicts a stationary velocity field.
+        raw_field = self.output(x)
+        displacement = (
+            self.svf_transformer.integrate(raw_field)
+            if self.svf_transformer is not None
+            else raw_field
+        )
         #check for NaN in output
         if torch.isnan(displacement).any():
             print("Warning: NaN detected in pretrainedUNet output displacement tensor!")
@@ -685,7 +715,7 @@ def convert_pretrained_to_spiking(
 
     # Threshold calibration: run calibration data through the ANN and set
     # each LIF neuron's v_th to the layer-wise activation percentile.
-    if calibration_loader is not None:
+    if calibration_loader is not None and threshold_percentile > 0:
         device = next(pretrained_model.parameters()).device
         thresholds = calibrate_thresholds(
             pretrained_model,
@@ -696,7 +726,6 @@ def convert_pretrained_to_spiking(
         _apply_calibrated_thresholds(spiking_model, thresholds)
     else:
         print("[convert_pretrained_to_spiking] No calibration_loader provided; "
-              "using default v_th=1.0 for all LIF neurons. "
-              "For best results pass a calibration_loader.")
+              "using default v_th=1.0 for all LIF neurons.")
 
     return spiking_model
